@@ -1,9 +1,11 @@
 """Fullscreen terminal dashboard for simulation and live activity.
 
-Simulation follows the current 5-minute window on the wall clock. Live mode
-starts the order loop in this process and draws it. `--follow` only tails a
-loop that is already running. Rendering lives in spork30.screen; this module
-owns the process plumbing (log tail, sim thread, keys, redraw).
+Simulation follows the current 5-minute window on the wall clock, driven by
+spork30.simulate (real Binance spot, real Polymarket taker prints, modelled
+queue). Live mode starts the order loop in this process and draws it.
+`--follow` only tails a loop that is already running. Rendering lives in
+spork30.screen; this module owns the process plumbing (log tail, sim thread,
+keys, redraw).
 
     python -m spork30.dashboard
     python -m spork30.dashboard --follow
@@ -16,17 +18,15 @@ import os
 import sys
 import threading
 import time
-from decimal import Decimal 
+from decimal import Decimal
 from pathlib import Path
 
 from rich.console import Console
 
 from spork30.activity import Book, LogTail
 from spork30.config import TradingMode, load_config, reset_runtime
-from spork30.execution import ClipSchedule
-from spork30.models import BookTop
-from spork30.portfolio import Engine
 from spork30.screen import build
+from spork30.simulate import advance_to_now, run_wall_clock
 from spork30.spot import SpotCache
 
 def trading_notice(book: Book, log_path: str, now: int) -> str:
@@ -56,149 +56,6 @@ def live_status() -> str:
         f"sig {signature}",
     ]
     return "  ".join(parts)
-
-
-def run_wall_clock(stop: threading.Event, spot: SpotCache) -> None:
-    """Follow the current 5-minute window on the wall clock until stopped.
-
-    The Up reference is a simulation of the book from BTC versus that window's
-    open. It is not a new strategy rule. Demo fills are local tape, not the
-    target account.
-    """
-    config = load_config()
-    engine = Engine(config=config, clips=ClipSchedule(config.strategy, seed=30))
-    now = int(time.time())
-    window = now - (now % config.strategy.window_seconds)
-    _prime(spot, window)
-    begin = window - config.strategy.window_seconds - config.strategy.split_lead_seconds - 2
-    previous_ask: Decimal | None = None
-    for ts in range(begin, now + 1):
-        if stop.is_set():
-            return
-        previous_ask = _step_sim(engine, spot, ts, previous_ask)
-    last = now
-    while not stop.is_set():
-        ts = int(time.time())
-        if ts != last:
-            for missed in range(last + 1, ts + 1):
-                previous_ask = _step_sim(engine, spot, missed, previous_ask)
-            last = ts
-        stop.wait(0.05)
-    engine.save()
-
-
-def advance_to_now(spot: SpotCache) -> None:
-    """One catch-up to the current second, for a single printed frame."""
-    config = load_config()
-    engine = Engine(config=config, clips=ClipSchedule(config.strategy, seed=30))
-    now = int(time.time())
-    window = now - (now % config.strategy.window_seconds)
-    _prime(spot, window)
-    begin = window - config.strategy.window_seconds - config.strategy.split_lead_seconds - 2
-    previous_ask: Decimal | None = None
-    for ts in range(begin, now + 1):
-        previous_ask = _step_sim(engine, spot, ts, previous_ask)
-    engine.save()
-
-
-def _prime(spot: SpotCache, window: int) -> None:
-    from spork30.spot import fetch_price_to_beat
-
-    spot.follow(window)
-    spot.remember(window, fetch_price_to_beat(window))
-    spot.remember(window - 300, fetch_price_to_beat(window - 300))
-    deadline = time.time() + 2.0
-    while spot.snapshot()[0] is None and time.time() < deadline:
-        time.sleep(0.05)
-
-
-def _step_sim(engine: Engine, spot: SpotCache, now: int, previous_ask: Decimal | None) -> Decimal | None:
-    window = engine.config.strategy.window_seconds
-    current = now - (now % window)
-    spot.follow(current)
-    btc, beat, beat_window, _error = spot.snapshot()
-    if beat_window != current:
-        beat = spot.price_for(current)
-    ask = _sim_up(btc, beat, previous_ask)
-    # One-tick book on the venue's 0.01 grid, as observed live.
-    book = BookTop(bid=ask - Decimal("0.01"), ask=ask, observed_ts=now, tick=Decimal("0.01"))
-    resolved, winner = _previous_resolution(spot, current, now, btc)
-    # The fair value (U6) gets the same Chainlink TWAP the simulated book is
-    # built from, against the window's Polymarket beat: one series, no basis.
-    engine.step(
-        now=now,
-        book=book,
-        last_up_trade=None,
-        resolved=resolved,
-        winner=winner,
-        emergency_stop=False,
-        spot=btc,
-        beat=beat,
-    )
-    _demo_fills(engine, f"{engine.config.strategy.slug_prefix}-{current}", now, current, window, btc, beat)
-    return ask
-
-
-def _sim_up(btc: Decimal | None, beat: Decimal | None, previous: Decimal | None) -> Decimal:
-    if btc is None or beat is None or beat <= 0:
-        target = Decimal("0.500")
-    else:
-        shift = (btc - beat) / beat * Decimal("40")
-        target = Decimal("0.50") + shift
-        if target < Decimal("0.05"):
-            target = Decimal("0.05")
-        elif target > Decimal("0.95"):
-            target = Decimal("0.95")
-    target = target.quantize(Decimal("0.01"))
-    if previous is None:
-        return target
-    delta = target - previous
-    if delta > Decimal("0.05"):
-        delta = Decimal("0.05")
-    elif delta < Decimal("-0.05"):
-        delta = Decimal("-0.05")
-    return (previous + delta).quantize(Decimal("0.01"))
-
-
-def _previous_resolution(
-    spot: SpotCache, current: int, now: int, btc: Decimal | None
-) -> tuple[bool, str | None]:
-    previous = current - 300
-    # The account's redeem-only print is 65 seconds after the window ends.
-    if now < previous + 365:
-        return False, None
-    beat = spot.price_for(previous)
-    end_price = spot.price_for(current)
-    if end_price is None:
-        end_price = btc
-    if beat is None or end_price is None:
-        return False, None
-    return True, "Up" if end_price >= beat else "Down"
-
-
-def _demo_fills(
-    engine: Engine,
-    slug: str,
-    now: int,
-    start: int,
-    window: int,
-    btc: Decimal | None,
-    beat: Decimal | None,
-) -> None:
-    """Lift 5 shares of the side the spot move favors, every 20 seconds.
-
-    Local demonstration flow so the tape shows sells. Not the target account.
-    """
-    if not (start <= now < start + window) or (now - start) % 20 != 0 or now == start:
-        return
-    market = engine.markets.get(slug)
-    if market is None:
-        return
-    favor = "Up" if btc is not None and beat is not None and btc >= beat else "Down"
-    for order in list(market.orders.values()):
-        if order.live and order.outcome == favor and order.remaining >= 5:
-            engine.apply_fill(order.order_id, Decimal("5"), order.price, ts=now)
-            return
 
 
 class _Screen:
@@ -256,7 +113,8 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Watch spork30 simulation or live activity")
     parser.add_argument("--follow", action="store_true", help="tail the decision log and do not start a simulation")
     parser.add_argument("--once", action="store_true", help="print one frame and exit, for a non-interactive terminal")
-    parser.add_argument("--pace", type=float, default=0.012, help="seconds to sleep per simulated second")
+    parser.add_argument("--pace", type=float, default=0.012,
+                        help="seconds to sleep per replayed second while the simulation catches up to now (0 = as fast as possible)")
     parser.add_argument("--init", action="store_true", help="clear this mode's decision log and state, then open the screen")
     args = parser.parse_args(argv)
     config = load_config()
@@ -273,7 +131,7 @@ def main(argv: list[str] | None = None) -> None:
     elif follow:
         status = "following the decision log"
     else:
-        status = "live 5-minute clock, sim sells are local"
+        status = "live 5-minute clock, fills modelled from public taker prints"
         log_path.write_text("", encoding="utf-8")
 
     stop = threading.Event()
@@ -286,7 +144,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         if args.once or not sys.stdout.isatty():
             if not follow:
-                advance_to_now(spot)
+                advance_to_now(spot, config)
             for record in tail.read_new():
                 book.apply(record)
             wall = int(time.time())
@@ -314,7 +172,8 @@ def main(argv: list[str] | None = None) -> None:
             worker = threading.Thread(target=_embedded_loop, args=(stop, loop_error), name="live-loop", daemon=True)
             worker.start()
         elif not follow:
-            worker = threading.Thread(target=run_wall_clock, args=(stop, spot), daemon=True)
+            worker = threading.Thread(target=run_wall_clock, args=(stop, spot, config),
+                                      kwargs={"pace": args.pace}, daemon=True)
             worker.start()
 
         console = Console()

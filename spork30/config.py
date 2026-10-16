@@ -104,6 +104,30 @@ class StrategyConfig:
     spot_lag_seconds: int = 1
     # Fallback annualised volatility when realised vol cannot be measured.
     fair_vol_annual: Decimal = Decimal("0.45")
+    # With the fair value on and spot momentarily missing (no print inside
+    # MAX_SPOT_AGE_SECONDS), resting asks are held this many seconds before
+    # they are pulled; no new ask is placed meanwhile. Cancelling on the first
+    # stale tick re-posted at the back of the queue 42 times per window in the
+    # Oct 15 simulation (2,390 `no_spot_reference` pulls over 57 windows). 0 =
+    # pull at once, the old behaviour.
+    spot_stale_grace_seconds: int = 2
+    # --- Audit hypotheses (Oct 2026), each off at 0. See docs/audit-2026-10.md
+    # for the train/test evidence behind the defaults chosen here.
+    #
+    # H1 Withhold an ask that would rest this many ticks or more above its
+    # outcome's touch. With the fair value above the touch the engine rests
+    # at fair + edge, behind the market; the only takers who reach it are
+    # sweeping through the touch, and those fills sold the winner 75-84% of
+    # the time in the replay. 1 = only ever join the touch. 0 = off.
+    fair_gap_withhold_ticks: int = 0
+    # H2 Pull both asks for the final N seconds of the window. 0 = off.
+    quote_pause_final_seconds: int = 0
+    # H3 Edge scales with the volatility of the time left:
+    # edge = max(fair_edge, mult * sigma * sqrt(seconds_left)). 0 = off.
+    fair_edge_vol_mult: Decimal = Decimal("0")
+    # H4 After a fill on one outcome, withhold that outcome's ask for N
+    # seconds so one sweep cannot take several clips in a row. 0 = off.
+    fill_cooldown_seconds: int = 0
     # Maker rebate as measured on the account's seven daily MAKER_REBATE
     # payments: 41-43 bps of sold notional (64 on one day). Used for the
     # estimate on the screen and in the replay; the bot never sees the
@@ -199,7 +223,12 @@ def load_config() -> AppConfig:
             fair_undercut=os.environ.get("FAIR_UNDERCUT", "1" if defaults.fair_undercut else "0").strip() in {"1", "true", "yes", "on"},
             spot_lag_seconds=_int("SPOT_LAG_SECONDS", defaults.spot_lag_seconds),
             fair_vol_annual=_decimal("FAIR_VOL_ANNUAL", str(defaults.fair_vol_annual)),
+            spot_stale_grace_seconds=_int("SPOT_STALE_GRACE_SECONDS", defaults.spot_stale_grace_seconds),
             maker_rebate_bps=_decimal("MAKER_REBATE_BPS", str(defaults.maker_rebate_bps)),
+            fair_gap_withhold_ticks=_int("FAIR_GAP_WITHHOLD_TICKS", defaults.fair_gap_withhold_ticks),
+            quote_pause_final_seconds=_int("QUOTE_PAUSE_FINAL_SECONDS", defaults.quote_pause_final_seconds),
+            fair_edge_vol_mult=_decimal("FAIR_EDGE_VOL_MULT", str(defaults.fair_edge_vol_mult)),
+            fill_cooldown_seconds=_int("FILL_COOLDOWN_SECONDS", defaults.fill_cooldown_seconds),
         ),
         risk=RiskConfig(
             max_position_per_outcome=_decimal("MAX_POSITION", "800"),

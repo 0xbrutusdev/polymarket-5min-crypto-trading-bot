@@ -13,7 +13,7 @@ from typing import Callable, Protocol
 
 from spork30.config import AppConfig, load_config
 from spork30.execution import ClipSchedule
-from spork30.live import _redact, assert_live_allowed, submit
+from spork30.live import LiveTradingDisabled, _redact, assert_live_allowed, live_preflight, read_collateral, submit
 from spork30.models import BookTop, Phase
 from spork30.portfolio import Engine
 from spork30.spotfeed import SpotFeed
@@ -86,7 +86,9 @@ def run_loop(
                 resolved, winner = venue.resolution(now)
                 spot = beat = sigma = None
                 if spot_feed is not None:
-                    spot = spot_feed.fresh_price(now=now)
+                    # Spot age is measured against the wall clock: the
+                    # whole-second tick can be up to a second behind it.
+                    spot = spot_feed.fresh_price(now=time.time() if now_fn is None else now)
                     beat = spot_feed.beat_for(now - (now % window_seconds))
                     sigma = spot_feed.sigma()
                 actions = engine.step(
@@ -204,9 +206,18 @@ def run_live(stop: threading.Event | None = None, quiet: bool = False) -> None:
 
     config = load_config()
     assert_live_allowed(config)
-    venue = PolymarketVenue.from_env(config)
     engine = Engine(config=config, clips=ClipSchedule(config.strategy, seed=30))
     engine.load()
+    try:
+        collateral = read_collateral(config)
+    except Exception as exc:
+        collateral = None
+        if not quiet:
+            print(f"collateral check skipped: {_redact(str(exc))}", flush=True)
+    problems = live_preflight(config, collateral=collateral, open_markets=engine.open_count())
+    if problems:
+        raise LiveTradingDisabled("; ".join(problems))
+    venue = PolymarketVenue.from_env(config)
     # The fair value needs ~60 s of spot before a window to measure its beat,
     # so the feed is opened before the loop; the first window after start
     # quotes only once that history exists.
@@ -348,6 +359,7 @@ def _undo_split(engine: Engine, payload: dict) -> None:
     if market.down >= size:
         market.down -= size
     market.cash += size
+    market.split_size = max(market.split_size - size, Decimal("0"))
     if market.phase not in {Phase.HALTED, Phase.CLOSED}:
         engine.halt(market, "SPLIT_FAILED")
 
@@ -362,6 +374,7 @@ def _undo_merge(engine: Engine, payload: dict) -> None:
     market.up += size
     market.down += size
     market.cash -= size
+    market.merged -= size
     market.flatten_done = False
     engine.halt(market, "MERGE_FAILED")
 
@@ -377,6 +390,7 @@ def _undo_redeem(engine: Engine, payload: dict) -> None:
     if winner in {"Up", "Down"} and size > 0:
         market.add(winner, size)
         market.cash -= size
+        market.redeemed -= size
     if market.pnl_booked:
         # _book_cycle counted this market's post-redeem cash; take it back out.
         engine.risk_state.realized_pnl_today -= booked

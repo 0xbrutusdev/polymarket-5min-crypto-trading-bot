@@ -35,7 +35,7 @@ A stale book, a missing spot price, or the emergency-stop file pulls quotes. The
 
 Two pricers live in the strategy. The default is the spot one.
 
-**Spot fair value.** P(Up) is the probability implied by BTC spot versus the window’s price to beat, the time left, and realised volatility. The settlement TWAP still has to average the last 60 seconds, so a move with less than that left only partly counts. There is no directional view in the number: it is only the distance already travelled. Each ask is `fair + 0.03`, rounded up to the tick, and never through the touch. If fair is below the best ask, the quote joins the ask. If spot is older than a few seconds, the bot rests nothing.
+**Spot fair value.** P(Up) is the probability implied by BTC spot versus the window’s price to beat, the time left, and realised volatility. The settlement TWAP still has to average the last 60 seconds, so a move with less than that left only partly counts. There is no directional view in the number: it is only the distance already travelled. Each ask is `fair + 0.03`, rounded up to the tick, and never through the touch. If fair is below the best ask, the quote joins the ask. If spot is older than 1.5 seconds, the bot rests nothing; the replay turns negative at 3 seconds of spot latency.
 
 **Touch quoting.** With fair value off, the Up ask joins the Up ask and the Down ask is the complement, one tick above the Down bid, so both orders stay post-only. The pair sums to `1 + spread`.
 
@@ -56,7 +56,11 @@ Maker rebate on the account has been about 42 bps of sold notional. The screen a
 | `spork30/spotfeed.py` | Binance spot for fair value. |
 | `spork30/spot.py` | Chainlink TWAP for the screen. |
 | `spork30/dashboard.py` | Terminal UI. |
-| `spork30/backtest.py` | Replay against public taker prints. |
+| `spork30/fillmodel.py` | Print-driven fills: a resting ask fills when a taker print trades through it. Shared by the replay and the simulation. |
+| `spork30/simulate.py` | Simulation mode: real Binance spot, real Polymarket taker prints, modelled queue. |
+| `spork30/backtest.py` | Replay against cached public taker prints. |
+| `spork30/diagnostics.py` | Fill-level markouts, regime breakdowns, PnL decomposition, bootstrap intervals. |
+| `spork30/audit.py` | Frozen-dataset baseline and train/test evaluation of strategy changes. |
 | `spork30/live.py` | Account check, and the only path that signs. |
 
 Every decision is one JSON line in `data/runtime/sim/decisions.jsonl` or `data/runtime/live/decisions.jsonl`. The screen reads that file. It does not care which process wrote it.
@@ -83,13 +87,15 @@ python -m spork30
 
 ### Terminal
 
-Follows the current 5-minute window on the wall clock. Simulated sells are local tape, not the account.
+Follows the current 5-minute window on the wall clock. In simulation mode the engine quotes off the same Binance spot feed live uses (trade and book-ticker streams), against the live window's real CLOB top of book polled once a second, and a resting ask fills only when a real taker print trades through it after `SIM_QUEUE_AHEAD` shares (default 200, the queue that reproduces the reference account's volume) at the same price. The public print tape is indexed 15 s to minutes late, so a print may fill an ask the engine has since replaced; the window's health line counts those. Nothing is sent; the mint, fills, merge and redeem are local bookkeeping.
 
 ```bash
 python -m spork30.dashboard
 ```
 
-`q` or Ctrl+C quits. `--once` prints a single frame. `--init` clears this mode’s decision log and state first.
+`q` or Ctrl+C quits. `--once` prints a single frame after catching up on the current window's prints. `--init` clears this mode’s decision log and state first. `--pace` slows the catch-up replay (seconds per replayed second).
+
+What the simulation measures is stated on its health pane: the prints, their prices, sizes and the top of book are real; the queue position is modelled (the print-implied touch stands in only while the book poll is down). Before Oct 15 2026 the simulation filled a synthetic 5 shares every 20 s on whichever side BTC was moving toward; the losses in logs from before then measure that construction, not the strategy (see `docs/audit-2026-10.md`). Until later that day its touch came from the lagging print tape and every stale spot tick cancelled both asks (see `docs/reference-gap-2026-10.md`).
 
 In live mode the dashboard starts the order loop in the same process. To watch a loop that is already running:
 
@@ -105,7 +111,32 @@ Drives the same engine with a book rebuilt from public taker prints. A resting a
 python -m spork30.backtest --windows 48 --queue 0,250,500,1000
 ```
 
-Queue position, the reconstructed touch, and the assumption that our own asks do not move anyone else are stated in the output. Treat the PnL as a measurement of that model.
+Queue position, the reconstructed touch, and the assumption that our own asks do not move anyone else are stated in the output. Treat the PnL as a measurement of that model. `--fills path` writes one row per modelled fill with its markouts.
+
+### Diagnostics and audit
+
+```bash
+python -m spork30.diagnostics --queue 250 --lag 2            # markouts, regimes, decomposition, bootstrap CI
+python -m spork30.diagnostics --queue 100 --touch-only --lag 2
+python -m spork30.audit baseline                              # frozen windows, queue 0/100/250 x lag 1/2/3, train/test
+python -m spork30.audit experiments --hypothesis gap          # train-chosen candidate, judged on the test set
+python -m spork30.audit compare --set fair_gap_withhold_ticks=1
+python -m spork30.audit calibrate                             # which SIM_QUEUE_AHEAD reproduces the reference account's volume
+```
+
+The first `audit` run freezes the window list in `data/backtest/audit-dataset.json`; later tables are on identical windows. A change is adopted only if it passes the rule written in `spork30/audit.py` on the test set under both conservative fill models; the objective is cash plus `--rebate-bps` (default `MAKER_REBATE_BPS`), with the rebate reported separately, and every table ends with the reference account's own row on the same windows. The Oct 2026 results are in `docs/audit-2026-10.md`.
+
+### Reference account
+
+The strategy is forked from the maker account `0x1dd2a69e73ba444ecd5d87f0073d51a670ad51c2`. `spork30/reference.py` pulls its public activity (read-only data-api, cached under `data/reference/`), rebuilds every window it traded, and aligns its fills with the cached prints and Binance spot next to a replay of this bot on the same windows:
+
+```bash
+python -m spork30.reference fetch --days 10
+python -m spork30.reference profile --windows-json data/reference/windows.json
+python -m spork30.reference align --queue 250 --lag 1
+```
+
+The Oct 2026 comparison and what it changed are in `docs/reference-gap-2026-10.md`.
 
 ### Tests
 
@@ -132,6 +163,8 @@ python -m spork30.live --run    # sign and run the loop
 
 `--init` clears the live decision log and engine state. It does not touch the emergency-stop file.
 
+`--run` also refuses to start when `FAIR_EDGE` is 0 (touch quoting replayed at -12.4 USDC per window on 288 out-of-sample windows; `ALLOW_TOUCH_QUOTING=YES` overrides), or when the funder holds less USDC than `SPLIT_SIZE` and there is no open market left to unwind. The check-only run prints the same preflight.
+
 Splits, merges, and redeems go through Polymarket’s gasless relayer and need builder credentials (`POLYMARKET_BUILDER_API_KEY`, `POLYMARKET_BUILDER_SECRET`, `POLYMARKET_BUILDER_PASSPHRASE`). Orders are post-only on the CLOB. On exit the loop cancels every order it still believes is live.
 
 **Stop.** Create the file `data/runtime/EMERGENCY_STOP` (or whatever `EMERGENCY_STOP_FILE` points at). New orders are refused and the market halts. Delete the file to clear the stop.
@@ -151,6 +184,7 @@ Defaults are the policy above. Set any of these in the environment or in `spork3
 | `REDEEM_DELAY_SECONDS` | `366` | Redeem the unpaired winner |
 | `FAIR_EDGE` | `0.03` | Cents added to spot-implied fair. `0` quotes the touch |
 | `FAIR_UNDERCUT` | off | Allow the fair ask to step inside the touch |
+| `ALLOW_TOUCH_QUOTING` | unset | `YES` lets `--run` start with `FAIR_EDGE=0` |
 | `SPOT_LAG_SECONDS` | `1` | Spot age assumed by the replay |
 | `FAIR_VOL_ANNUAL` | `0.45` | Vol used when realised vol cannot be measured |
 | `MAX_LEAN_SHARES` | `3` | Pull an ask once that side is this far ahead. `0` disables |
@@ -159,6 +193,12 @@ Defaults are the policy above. Set any of these in the environment or in `spork3
 | `REQUOTE_THRESHOLD_TICKS` | `0` | Minimum touch move before a replace |
 | `REQUOTE_MIN_SECONDS` | `0` | Minimum resting age before a replace |
 | `MAKER_REBATE_BPS` | `42` | Rebate estimate on the screen and in the replay |
+| `FAIR_GAP_WITHHOLD_TICKS` | `0` | Withhold an ask that would rest this many ticks or more above its touch. `1` only ever joins the touch. `0` disables |
+| `QUOTE_PAUSE_FINAL_SECONDS` | `0` | Pull both asks for the last N seconds of the window. `0` disables |
+| `FAIR_EDGE_VOL_MULT` | `0` | Edge at least this multiple of sigma·sqrt(seconds left). `0` disables |
+| `FILL_COOLDOWN_SECONDS` | `0` | Withhold a side for N seconds after it fills. `0` disables |
+| `SPOT_STALE_GRACE_SECONDS` | `2` | Keep resting asks this long through a spot outage before pulling them. `0` pulls on the first stale tick |
+| `SIM_QUEUE_AHEAD` | `200` | Simulation only: shares assumed ahead of each ask at its price (calibrated to the reference account; replay tables use 250 and 100) |
 | `MAX_POSITION` | `800` | Shares per outcome |
 | `MAX_ORDER_SIZE` | `20` | Shares per order |
 | `MAX_DAILY_LOSS` | `1000` | Halt new orders after this realised loss |

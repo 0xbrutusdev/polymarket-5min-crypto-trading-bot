@@ -60,8 +60,11 @@ def fair_asks(
     up_ask: Decimal,
     up_bid: Decimal | None,
     tick: Decimal,
+    edge: Decimal | None = None,
 ) -> tuple[Decimal, Decimal]:
     """Both asks at fair + edge, each on the maker side of its own book.
+
+    `edge` overrides `strategy.fair_edge` (the vol-scaled edge, H3).
 
     Up ask = ceil(fair + edge); Down ask = ceil((1 - fair) + edge). Neither
     goes below one tick above its own bid (the Down bid is 1 - Up ask).
@@ -69,7 +72,7 @@ def fair_asks(
     the quote joins the touch when fair is below it and rests behind the
     touch when fair is above it, which is where the touch is about to go.
     """
-    edge = strategy.fair_edge
+    edge = strategy.fair_edge if edge is None else edge
     up = ceil_price(fair + edge, tick)
     down = ceil_price((Decimal("1") - fair) + edge, tick)
     up_floor = (up_bid + tick) if up_bid is not None else up_ask
@@ -83,6 +86,39 @@ def fair_asks(
     down = max(down, down_floor)
     top = Decimal("1") - tick
     return min(top, max(tick, up)), min(top, max(tick, down))
+
+
+def quote_edge(strategy: StrategyConfig, sigma: float | None, seconds_left: int) -> Decimal:
+    """The edge to ask over fair: `fair_edge`, or with `fair_edge_vol_mult`
+    on, at least mult * sigma * sqrt(seconds_left) (H3). The fair value's
+    own uncertainty over the time left, in price terms, is of that order."""
+    edge = strategy.fair_edge
+    if strategy.fair_edge_vol_mult <= 0 or sigma is None or seconds_left <= 0:
+        return edge
+    scaled = Decimal(str(round(float(strategy.fair_edge_vol_mult) * sigma * math.sqrt(seconds_left), 6)))
+    return max(edge, scaled)
+
+
+def rests_above_touch(price: Decimal, touch: Decimal | None, tick: Decimal, strategy: StrategyConfig) -> bool:
+    """H1: True when the ask would rest `fair_gap_withhold_ticks` or more
+    ticks above its outcome's touch and the guard is on. With the touch
+    unknown nothing is withheld."""
+    gap = strategy.fair_gap_withhold_ticks
+    if gap <= 0 or touch is None:
+        return False
+    return (price - touch) / tick >= gap
+
+
+def in_final_pause(now: int, start: int, strategy: StrategyConfig) -> bool:
+    """H2: True during the last `quote_pause_final_seconds` of the window."""
+    pause = strategy.quote_pause_final_seconds
+    return pause > 0 and now >= start + strategy.window_seconds - pause
+
+
+def in_fill_cooldown(now: int, last_fill_ts: int | None, strategy: StrategyConfig) -> bool:
+    """H4: True for `fill_cooldown_seconds` after the outcome's last fill."""
+    cooldown = strategy.fill_cooldown_seconds
+    return cooldown > 0 and last_fill_ts is not None and now - last_fill_ts < cooldown
 
 
 def active_window(now: int, strategy: StrategyConfig) -> int:

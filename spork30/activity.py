@@ -45,9 +45,18 @@ class MarketView:
     split_size: Decimal = Decimal("0")
     reference: Decimal | None = None
     replaces: int = 0
+    # The engine's own total from `cycle_closed`, checked against `cash`.
+    booked_cash: Decimal | None = None
     orders: dict[str, OrderView] = field(default_factory=dict)
     last_quote: dict[str, Decimal] = field(default_factory=dict)
     last: str = ""
+
+    def marked(self) -> Decimal:
+        """Cash plus the pairs still held at their merge value of 1. The
+        unpaired side is not counted until it is redeemed."""
+        if self.phase == "CLOSED":
+            return self.cash
+        return self.cash + min(self.up, self.down)
 
     def inventory(self, outcome: str, value: Decimal) -> None:
         if outcome == "Up":
@@ -123,6 +132,10 @@ class Book:
             return
         if event == "cycle_closed":
             self.realized_today = _dec(record.get("realized_today"))
+            if market is not None:
+                market.booked_cash = _dec(record.get("cash"))
+                if record.get("winner"):
+                    market.winner = str(record.get("winner"))
             return
         if event == "day_roll":
             self.realized_today = Decimal("0")
@@ -206,8 +219,9 @@ class Book:
                 market.up -= amount
             elif winner == "Down":
                 market.down -= amount
-            if "cash" in record:
-                market.cash = _dec(record.get("cash"))
+            # Rebuilt from the legs, not copied from the record, so a lost
+            # line shows up as a mismatch against `cycle_closed`.
+            market.cash += amount
             market.phase = "CLOSED"
             market.winner = winner
             market.orders.clear()
@@ -272,6 +286,9 @@ class Book:
         # A failed mint leaves no tokens whether the failure was reported at
         # send time or, with the chain worker, a few ticks after the ack.
         if market is not None and kind == "SPLIT":
+            # An acked mint already debited cash; give it back.
+            market.cash += market.split_size
+            market.split_size = Decimal("0")
             market.up = Decimal("0")
             market.down = Decimal("0")
             market.phase = "HALTED"
@@ -296,6 +313,26 @@ class Book:
 
     def open_cash(self) -> Decimal:
         return sum((market.cash for market in self.markets.values() if market.phase != "CLOSED"), Decimal("0"))
+
+    def open_marked(self) -> Decimal:
+        return sum((market.marked() for market in self.markets.values() if market.phase != "CLOSED"), Decimal("0"))
+
+    def sold_winner(self) -> tuple[Decimal, Decimal]:
+        """(shares sold of the side that went on to win, all shares sold) over resolved windows."""
+        won = total = Decimal("0")
+        for market in self.markets.values():
+            if market.winner not in {"Up", "Down"}:
+                continue
+            won += market.sold_up if market.winner == "Up" else market.sold_down
+            total += market.sold_up + market.sold_down
+        return won, total
+
+    def mismatches(self) -> list[MarketView]:
+        """Closed windows whose replayed cash differs from the engine's booked total."""
+        return [
+            market for market in self.markets.values()
+            if market.phase == "CLOSED" and market.booked_cash is not None and market.booked_cash != market.cash
+        ]
 
     def closed_count(self) -> int:
         return sum(1 for market in self.markets.values() if market.phase == "CLOSED")
@@ -327,7 +364,7 @@ class Book:
                 continue
             stamp = datetime.fromtimestamp(market.start, tz=timezone.utc).strftime("%Y-%m-%d")
             if stamp == day:
-                total += market.cash
+                total += market.marked()
         return day, total
 
     def day_pnl(self) -> tuple[str, Decimal]:

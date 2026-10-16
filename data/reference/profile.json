@@ -1,0 +1,141 @@
+{
+ "windows": 3108,
+ "traded_windows": 3042,
+ "first": "2026-10-05",
+ "last": "2026-10-16",
+ "fills_per_window": 21.25,
+ "fills_per_traded_window_median": 19.0,
+ "fills_p90": 40.0,
+ "shares_per_window": 153.9,
+ "shares_p10": 46.069381,
+ "shares_p90": 281.561339,
+ "sold_winner_pct": 48.6,
+ "lean_median": 6.154115,
+ "lean_p90": 14.691396,
+ "cash_per_window": 0.2868,
+ "cash_total": 891.39,
+ "cash_median": 0.45,
+ "cash_worst": -40.3,
+ "cash_best": 26.05,
+ "cash_p10": -5.17,
+ "cash_p90": 5.4,
+ "proceeds_per_window": 75.12,
+ "rebate_bps_median": 43.05,
+ "rebate_per_window": 0.3234,
+ "rebate_by_day": {
+  "2026-10-05": {
+   "rebate": 132.7003,
+   "proceeds": 20480.4051,
+   "windows": 210,
+   "bps": 64.8,
+   "rebate_per_window": 0.6319,
+   "cash": 73.1
+  },
+  "2026-10-06": {
+   "rebate": 102.2875,
+   "proceeds": 23655.4763,
+   "windows": 288,
+   "bps": 43.2,
+   "rebate_per_window": 0.3552,
+   "cash": 77.71
+  },
+  "2026-10-07": {
+   "rebate": 86.9661,
+   "proceeds": 20665.384,
+   "windows": 288,
+   "bps": 42.1,
+   "rebate_per_window": 0.302,
+   "cash": 67.41
+  },
+  "2026-10-08": {
+   "rebate": 100.6303,
+   "proceeds": 23384.159,
+   "windows": 288,
+   "bps": 43.0,
+   "rebate_per_window": 0.3494,
+   "cash": 161.66
+  },
+  "2026-10-09": {
+   "rebate": 97.3216,
+   "proceeds": 22829.5179,
+   "windows": 288,
+   "bps": 42.6,
+   "rebate_per_window": 0.3379,
+   "cash": 89.49
+  },
+  "2026-10-10": {
+   "rebate": 120.3492,
+   "proceeds": 28844.13195,
+   "windows": 288,
+   "bps": 41.7,
+   "rebate_per_window": 0.4179,
+   "cash": -4.62
+  },
+  "2026-10-11": {
+   "rebate": 129.9251,
+   "proceeds": 31616.0865,
+   "windows": 288,
+   "bps": 41.1,
+   "rebate_per_window": 0.4511,
+   "cash": 56.79
+  },
+  "2026-10-12": {
+   "rebate": 86.9819,
+   "proceeds": 20178.0013,
+   "windows": 288,
+   "bps": 43.1,
+   "rebate_per_window": 0.302,
+   "cash": 75.2
+  },
+  "2026-10-13": {
+   "rebate": 61.3584,
+   "proceeds": 13869.2695,
+   "windows": 288,
+   "bps": 44.2,
+   "rebate_per_window": 0.2131,
+   "cash": -33.05
+  },
+  "2026-10-14": {
+   "rebate": 55.0869,
+   "proceeds": 12606.9628,
+   "windows": 288,
+   "bps": 43.7,
+   "rebate_per_window": 0.1913,
+   "cash": 101.01
+  }
+ },
+ "fill_offset_p10_p50_p90": [
+  38.0,
+  159.0,
+  254.0
+ ],
+ "fills_by_minute": {
+  "0": 10717,
+  "1": 12835,
+  "2": 14392,
+  "3": 16508,
+  "4": 11590
+ },
+ "clip_sizes": {
+  "partial": 28648,
+  "10": 15168,
+  "5": 11442,
+  "15": 8164,
+  "20": 770,
+  "2": 276,
+  "4": 254,
+  "6": 249
+ },
+ "pair_sum_median": 1.0,
+ "pair_sum_share_at_or_above_1": 0.682,
+ "distinct_prices_per_side_median": 8,
+ "split_lead_median": 293.0,
+ "merge_offset_median": 358.0,
+ "redeem_offset_median": 366,
+ "winner_source": {
+  "redeem": 2809,
+  "unknown": 234,
+  "redeem-loser": 63,
+  "inferred": 2
+ }
+}

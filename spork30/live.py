@@ -98,11 +98,44 @@ def _funder_owner(rpc: str, funder: str) -> str | None:
     return "0x" + result[-40:]
 
 
-def _usdc(raw: object) -> str:
-    text = str(raw)
-    if text.isdigit():
-        return f"{(Decimal(text) / Decimal('1000000')).quantize(Decimal('0.01'))} USDC"
-    return text
+def read_collateral(config: AppConfig) -> Decimal:
+    """USDC the funder holds on the CLOB, in whole dollars. Sends nothing."""
+    from py_clob_client_v2 import ClobClient
+    from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
+
+    client = ClobClient(
+        "https://clob.polymarket.com",
+        chain_id=137,
+        key=os.environ.get("POLYMARKET_PRIVATE_KEY") or "",
+        signature_type=config.signature_type,
+        funder=config.funder,
+        use_server_time=True,
+    )
+    try:
+        creds = client.derive_api_key()
+    except Exception:
+        creds = client.create_or_derive_api_key()
+    client.set_api_creds(creds)
+    balance = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+    raw = balance.get("balance") if isinstance(balance, dict) else balance
+    return Decimal(str(raw or "0")) / Decimal("1000000")
+
+
+def live_preflight(config: AppConfig, *, collateral: Decimal | None, open_markets: int) -> list[str]:
+    """Reasons the live loop must not start. Empty means go.
+
+    Quoting off the Polymarket touch without the spot fair value replayed at
+    -12.4 USDC per window (t -28.7) on 288 windows it was not tuned on, Oct
+    12-13 2026; set ALLOW_TOUCH_QUOTING=YES to run it anyway. A split the
+    funder cannot pay for reverts on the relayer and halts the window, so an
+    empty wallet is refused unless there are open markets left to unwind.
+    """
+    problems: list[str] = []
+    if config.strategy.fair_edge <= 0 and os.environ.get("ALLOW_TOUCH_QUOTING") != "YES":
+        problems.append("FAIR_EDGE is 0: touch quoting lost 12.4 USDC per window out of sample")
+    if collateral is not None and collateral < config.strategy.split_size and open_markets == 0:
+        problems.append(f"collateral {collateral.quantize(Decimal('0.01'))} USDC is below SPLIT_SIZE {config.strategy.split_size}")
+    return problems
 
 
 def account_report(config: AppConfig | None = None) -> list[str]:
@@ -134,32 +167,20 @@ def account_report(config: AppConfig | None = None) -> list[str]:
         lines.append("blocked: the private key is not the owner of POLYMARKET_FUNDER")
         return lines
     try:
-        from py_clob_client_v2 import ClobClient
-        from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
-
-        client = ClobClient(
-            "https://clob.polymarket.com",
-            chain_id=137,
-            key=private_key,
-            signature_type=config.signature_type,
-            funder=config.funder,
-            use_server_time=True,
-        )
-        try:
-            creds = client.derive_api_key()
-        except Exception:
-            creds = client.create_or_derive_api_key()
-        client.set_api_creds(creds)
-        balance = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+        collateral = read_collateral(config)
     except Exception as exc:
         lines.append(f"clob auth failed: {_redact(str(exc))}")
         return lines
-    amount = balance.get("balance") if isinstance(balance, dict) else balance
-    lines.append(f"collateral {_usdc(amount)}")
+    lines.append(f"collateral {collateral.quantize(Decimal('0.01'))} USDC")
     lines.append("clob auth ok")
+    problems = live_preflight(config, collateral=collateral, open_markets=0)
+    for problem in problems:
+        lines.append(f"preflight: {problem}")
     lines.append("no order was sent")
     if config.trading_mode is not TradingMode.LIVE or os.environ.get("LIVE_TRADING_CONFIRM") != "YES":
         lines.append("send gate closed")
+    elif problems:
+        lines.append("send gate open, but --run will refuse to start until the preflight passes")
     else:
         lines.append("send gate open; python -m spork30.live --run starts the loop")
     return lines

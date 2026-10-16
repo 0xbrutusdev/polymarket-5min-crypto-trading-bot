@@ -59,15 +59,18 @@ def desired_asks(
     rule: str = "regime_B_complementary_maker_ask",
     skip: frozenset[str] = frozenset(),
     fair: Decimal | None = None,
+    edge: Decimal | None = None,
 ) -> list[DesiredOrder]:
     """Both asks, except outcomes in `skip` (the pair-balance cap withdraws one).
 
     With `fair` (spot-implied P(Up)) and `fair_edge` > 0 the asks are priced
-    at fair + edge; otherwise off the Polymarket touch.
+    at fair + edge (`edge` overrides the configured one); otherwise off the
+    Polymarket touch.
     """
     grid = tick or strategy.price_tick
     if fair is not None and strategy.fair_edge > 0:
-        up_price, down_price = fair_asks(fair, strategy, up_ask=quantize_price(up_reference, grid), up_bid=up_bid, tick=grid)
+        up_price, down_price = fair_asks(fair, strategy, up_ask=quantize_price(up_reference, grid), up_bid=up_bid,
+                                         tick=grid, edge=edge)
         rule = "spot_fair_plus_edge_maker_ask"
     else:
         up_price, down_price = complement_asks(up_reference, strategy, up_bid=up_bid, tick=tick)

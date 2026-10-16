@@ -88,7 +88,7 @@ def build(
     )
     root["right"].split_column(
         Layout(name="risk", size=10),
-        Layout(name="health", minimum_size=7),
+        Layout(name="health", minimum_size=8),
     )
     root["header"].update(header(book, mode=mode, status=status, emergency=emergency, sends=sends, now=now, notice=notice))
     root["market"].update(market_pane(book, now, btc, beat, notice))
@@ -231,7 +231,7 @@ def cycles_table(book: Book, now: int) -> Table:
         return table
     for market in rows:
         phase = _phase_shown(market, now)
-        pnl = market.cash
+        pnl = market.marked()
         pnl_style = "dim" if phase not in {"CLOSED", "HALTED"} else ("bright_green" if pnl >= 0 else "bright_red")
         table.add_row(
             _hhmm(market.start),
@@ -265,9 +265,9 @@ def risk_pane(book: Book, now: int, limits: dict) -> Panel:
     t.append(_money(realized), style="bold bright_green" if realized >= 0 else "bold bright_red")
     t.append(f"  / {closed} settled cycles", style="dim")
     t = line()
-    t.append("open cash  ", style="dim")
-    t.append(_money(book.open_cash()), style="yellow")
-    t.append("  unsettled windows, split debit included", style="dim")
+    t.append("open mark  ", style="dim")
+    t.append(_money(book.open_marked()), style="yellow")
+    t.append(f"  pairs at merge value, cash {_money(book.open_cash())}", style="dim")
     t = line()
     t.append(f"today      ", style="dim")
     t.append(_money(daily), style="bold")
@@ -296,6 +296,14 @@ def risk_pane(book: Book, now: int, limits: dict) -> Panel:
         t.append("exposure   ", style="dim")
         t.append(_bar(exposure, max_exposure), style="cyan")
         t.append(f" {_money(exposure)} of {_money(max_exposure)}  {len(book.open_markets())} open", style="dim")
+    won, sold = book.sold_winner()
+    if sold > 0:
+        share = won / sold * 100
+        t = line()
+        t.append("adverse    ", style="dim")
+        t.append(f"sold winner {share:.0f}%",
+                 style="bright_red" if share >= 60 else ("yellow" if share > 52 else "bright_green"))
+        t.append(f"  of {sold:.0f} sh settled; 50% is uninformed flow", style="dim")
     t = line()
     refusals = book.counts.get("risk_refuse", 0)
     rejects = book.counts.get("send_fail", 0)
@@ -310,6 +318,9 @@ def risk_pane(book: Book, now: int, limits: dict) -> Panel:
     t.append(str(rejects), style="bright_red" if rejects else "")
     t.append("  halts ", style="dim")
     t.append(str(halts), style="bright_red" if halts else "")
+    mismatched = len(book.mismatches()) + book.counts.get("pnl_mismatch", 0)
+    if mismatched:
+        t.append(f"  pnl mismatch {mismatched}", style="bold bright_red")
     return Panel(Group(*lines), title="pnl and limits", border_style="grey50")
 
 
@@ -356,13 +367,46 @@ def health_pane(book: Book, now: int, *, live: bool, sends: bool) -> Panel:
         text.append(f"    resting {h.get('live_orders', 0)}" if h else "", style="dim")
     else:
         text.append("fills  ", style="dim")
-        text.append("simulated: spot-favoured side, 5 every 20 s", style="dim")
+        text.append(f"real taker prints, modelled queue {h.get('queue_ahead', '-')} ahead", style="dim")
         text.append("\n")
         text.append("book   ", style="dim")
-        text.append("synthetic from BTC vs beat, 0.01 grid", style="dim")
+        source = h.get("book_source")
+        if source == "clob":
+            text.append(f"real CLOB top, {h.get('book_age_s')}s old", style="bright_green")
+        elif h.get("book_error"):
+            text.append(f"book poll down ({h.get('book_error')}), print-implied touch", style="bright_red")
+        else:
+            text.append("print-implied touch", style="yellow" if source == "prints" else "dim")
+        if h.get("tape_error"):
+            text.append(f"  print tape down: {h.get('tape_error')}", style="bright_red")
+        else:
+            polled = h.get("tape_age_s")
+            text.append(f"  {h.get('prints', 0)} prints this window", style="dim")
+            text.append(f", polled {polled}s ago" if polled is not None else "", style="dim")
+        text.append("\n")
+        text.append("spot   ", style="dim")
+        spot_age = h.get("spot_age_s")
+        if spot_age is None:
+            text.append(f"{h.get('spot_source', '-')} no price yet", style="yellow")
+        else:
+            text.append(f"{h.get('spot_source', '-')} age {spot_age}s",
+                        style="bright_green" if float(spot_age) <= 1.5 else "yellow")
+        text.append("\n")
+        text.append("quoted ", style="dim")
+        if h.get("open_seconds"):
+            quoted, open_s = int(h.get("quoted_seconds") or 0), int(h["open_seconds"])
+            share = quoted / open_s if open_s else 0.0
+            text.append(f"{quoted}/{open_s}s of this window", style="bright_green" if share >= 0.9 else "yellow")
+            text.append(f"  refusals {h.get('refusals', 0)}  pulls {h.get('pulls', 0)}  held {h.get('holds', 0)}",
+                        style="dim")
+            if "places" in h:
+                text.append(f"  places {h.get('places', 0)}  fills {h.get('window_fills', 0)}"
+                            f" ({h.get('late_fills', 0)} after a replace)", style="dim")
+        else:
+            text.append("window not open", style="dim")
         text.append("\n")
         text.append("note   ", style="dim")
-        text.append("not a forecast: run spork30.backtest", style="dim")
+        text.append("queue position is modelled: run spork30.backtest for a range", style="dim")
     return Panel(text, title="health", border_style="grey50")
 
 

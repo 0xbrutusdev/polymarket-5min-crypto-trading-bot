@@ -32,29 +32,22 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from pathlib import Path
 
 from spork30.config import AppConfig, RiskConfig, StrategyConfig, TradingMode
 from spork30.execution import ClipSchedule
-from spork30.models import BookTop, Phase
+from spork30.fillmodel import TICK, FillModel, FillRecord, Print, ReconstructedBook, print_from_trade
+from spork30.models import Phase
 from spork30.portfolio import Engine
 from spork30.spot import fetch_open
-from spork30.strategy import quantize_price, sigma_per_second
+from spork30.strategy import sigma_per_second
 
-TICK = Decimal("0.01")
+__all__ = ["Print", "ReconstructedBook", "TICK", "WindowData", "WindowResult", "replay_config", "replay_window"]
+
 # Oracle lag measured on the CTF contract for these markets (pass 2).
 ORACLE_LAG_SECONDS = 65
-
-
-@dataclass(frozen=True)
-class Print:
-    ts: int
-    outcome: str  # "Up" | "Down"
-    side: str  # taker side, "BUY" | "SELL"
-    price: Decimal
-    size: Decimal
 
 
 @dataclass
@@ -124,49 +117,6 @@ SPOT_HISTORY_SECONDS = 300
 BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 
 
-class ReconstructedBook:
-    """Up-token top of book implied by the most recent prints on either token."""
-
-    def __init__(self) -> None:
-        self.up_ask: Decimal | None = None
-        self.up_bid: Decimal | None = None
-
-    def update(self, p: Print) -> None:
-        price = quantize_price(p.price, TICK)
-        # A taker BUY prints at the ask of its token, a taker SELL at the bid.
-        # The Down book mirrors the Up book, so a Down print pins the other
-        # side of the Up book.
-        sets_ask = (p.outcome == "Up") == (p.side == "BUY")
-        level = price if p.outcome == "Up" else quantize_price(Decimal("1") - price, TICK)
-        if sets_ask:
-            self.up_ask = level
-            # The print is the freshest fact: a bid at or above the new ask is stale.
-            if self.up_bid is not None and self.up_bid >= level:
-                self.up_bid = level - TICK
-        else:
-            self.up_bid = level
-            if self.up_ask is not None and self.up_ask <= level:
-                self.up_ask = level + TICK
-
-    def top(self, now: int) -> BookTop | None:
-        if self.up_ask is None:
-            return None
-        ask = min(Decimal("0.99"), max(TICK, self.up_ask))
-        bid = self.up_bid
-        if bid is not None and bid >= ask:
-            bid = ask - TICK
-        return BookTop(bid=bid, ask=ask, observed_ts=now, tick=TICK)
-
-
-@dataclass
-class Resting:
-    order_id: str
-    outcome: str
-    price: Decimal
-    queue_ahead: Decimal
-    placed_at: int
-
-
 @dataclass
 class WindowResult:
     start: int
@@ -181,6 +131,11 @@ class WindowResult:
     rest_seconds: int = 0  # summed lifetime of every resting order
     used_fair: bool = False
     sigma: float = 0.0
+    # Every modelled fill with the state it was quoted from (diagnostics).
+    records: list[FillRecord] = field(default_factory=list)
+    # Spot path for the window and its beat, for markouts after each fill.
+    spot: list[tuple[int, Decimal]] = field(default_factory=list)
+    beat: Decimal | None = None
 
     @property
     def sold_winner(self) -> Decimal:
@@ -231,7 +186,8 @@ def replay_window(
     start = data.start
     window = strategy.window_seconds
     engine = ReplayEngine(config=config, clips=ClipSchedule(strategy, seed=seed))
-    book = ReconstructedBook()
+    model = FillModel(engine, data.slug, queue=queue, queue_at_touch_only=queue_at_touch_only, window_start=start)
+    book = model.book
     by_ts: dict[int, list[Print]] = {}
     first_tick = start - strategy.split_lead_seconds
     for p in data.prints:
@@ -239,19 +195,7 @@ def replay_window(
             book.update(p)
         else:
             by_ts.setdefault(p.ts, []).append(p)
-    resting: dict[str, Resting] = {}
-    fills = 0
-    sold = {"Up": Decimal("0"), "Down": Decimal("0")}
-    proceeds = Decimal("0")
-    places = 0
-    rest_seconds = 0
     slug = data.slug
-
-    def retire(order_id: str, now: int) -> None:
-        nonlocal rest_seconds
-        gone = resting.pop(order_id, None)
-        if gone is not None:
-            rest_seconds += now - gone.placed_at
 
     # Spot-referenced fair value (U6): the engine sees the spot close from
     # `spot_lag_seconds` ago (the kline for second t closes at t+1, so lag 1
@@ -283,80 +227,31 @@ def replay_window(
             beat=beat if use_fair else None,
             sigma=sigma,
         )
-        market = engine.markets.get(slug)
-        for action in actions:
-            if action.slug != slug:
-                continue
-            if action.kind == "PLACE":
-                places += 1
-                detail = action.detail
-                price = Decimal(detail["price"])
-                # `queue` shares are ahead of us when we join the touch. With
-                # queue_at_touch_only an ask resting above the touch (where
-                # fair + edge put it) starts a fresh level and has none ahead;
-                # the uniform model charges the queue at every level.
-                top = book.top(now)
-                touch = None
-                if top is not None:
-                    touch = top.ask if detail["outcome"] == "Up" else (Decimal("1") - top.bid if top.bid is not None else None)
-                ahead = Decimal("0") if (queue_at_touch_only and touch is not None and price > touch) else queue
-                resting[detail["order_id"]] = Resting(detail["order_id"], detail["outcome"], price, ahead, now)
-            elif action.kind == "CANCEL":
-                retire(action.detail.get("order_id", ""), now)
-        if market is not None:
-            for order_id in list(resting):
-                order = market.orders.get(order_id)
-                if order is None or not order.live:
-                    retire(order_id, now)
+        model.on_actions(actions, now)
+        model.sweep(now)
         for p in by_ts.get(now, []):
-            book.update(p)
-            if not quoting or p.side != "BUY" or market is None:
-                continue
-            size_left = p.size
-            # Price-time priority: the cheapest of our asks at or under the
-            # print price fills first.
-            eligible = sorted(
-                (r for r in resting.values() if r.outcome == p.outcome and r.price <= p.price),
-                key=lambda r: r.price,
-            )
-            for r in eligible:
-                if size_left <= 0:
-                    break
-                ahead = min(size_left, r.queue_ahead)
-                r.queue_ahead -= ahead
-                size_left -= ahead
-                if size_left <= 0:
-                    break
-                order = market.orders[r.order_id]
-                fill = min(size_left, order.remaining)
-                if fill <= 0:
-                    continue
-                engine.apply_fill(r.order_id, fill, r.price, ts=p.ts)
-                fills += 1
-                sold[r.outcome] += fill
-                proceeds += fill * r.price
-                size_left -= fill
-                if not order.live:
-                    retire(r.order_id, p.ts)
-    for order_id in list(resting):
-        retire(order_id, start + window)
+            model.on_print(p, quoting=quoting)
+    model.close(start + window)
     market = engine.markets.get(slug)
     if market is None or not market.split_submitted:
         return None
-    pnl = market.cash - proceeds * maker_fee_bps / Decimal("10000")
+    pnl = market.cash - model.proceeds * maker_fee_bps / Decimal("10000")
     return WindowResult(
         start=start,
         winner=data.winner,
         pnl=pnl,
-        fills=fills,
-        sold_up=sold["Up"],
-        sold_down=sold["Down"],
-        proceeds=proceeds,
-        places=places,
+        fills=model.fills,
+        sold_up=model.sold["Up"],
+        sold_down=model.sold["Down"],
+        proceeds=model.proceeds,
+        places=model.places,
         phase=market.phase.value,
-        rest_seconds=rest_seconds,
+        rest_seconds=model.rest_seconds,
         used_fair=use_fair,
         sigma=sigma,
+        records=list(model.records),
+        spot=data.spot,
+        beat=beat,
     )
 
 
@@ -520,11 +415,9 @@ def fetch_window(client, start: int, cache_dir: Path, *, spot: bool = False) -> 
     prints: list[Print] = []
     for page in client.list_trades(condition_id=market.condition_id, taker_only=True, page_size=500):
         for t in page.items:
-            outcome = labels.get(str(t.asset_id))
-            if outcome not in {"Up", "Down"}:
-                continue
-            side = t.side.value if hasattr(t.side, "value") else str(t.side)
-            prints.append(Print(int(t.timestamp.timestamp()), outcome, side.upper(), Decimal(str(t.price)), Decimal(str(t.size))))
+            p = print_from_trade(t, labels)
+            if p is not None:
+                prints.append(p)
         if len(prints) > 50_000:
             break
     prints.sort(key=lambda p: p.ts)
@@ -616,6 +509,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--seed", type=int, default=30)
     parser.add_argument("--cache", default="data/backtest", help="where prints are cached")
     parser.add_argument("--json", default="", help="also write the summary table to this path")
+    parser.add_argument("--fills", default="", help="write one JSON row per modelled fill (with markouts) to this path")
     args = parser.parse_args(argv)
     cache_dir = Path(args.cache)
 
@@ -668,6 +562,17 @@ def main(argv: list[str] | None = None) -> None:
         }
         Path(args.json).parent.mkdir(parents=True, exist_ok=True)
         Path(args.json).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    if args.fills:
+        from spork30.diagnostics import fill_rows
+
+        rows = [
+            {"variant": s.label, "queue": str(s.queue), **asdict(row)}
+            for s in summaries
+            for r in s.results
+            for row in fill_rows(r)
+        ]
+        Path(args.fills).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.fills).write_text(json.dumps(rows), encoding="utf-8")
 
 
 if __name__ == "__main__":

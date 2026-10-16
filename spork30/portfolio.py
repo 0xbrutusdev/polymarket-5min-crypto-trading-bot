@@ -21,10 +21,15 @@ from spork30.risk import RiskRefusal, RiskState, check_order, note_order
 from spork30.strategy import (
     fair_up,
     flatten_method,
+    in_fill_cooldown,
+    in_final_pause,
     lean_blocked,
     market_slug,
+    quantize_price,
+    quote_edge,
     quoting_open,
     redeem_due,
+    rests_above_touch,
     should_flatten,
     should_requote,
     should_split,
@@ -47,6 +52,11 @@ CHAIN_FAILURES = frozenset({"SPLIT_FAILED", "MERGE_FAILED", "REDEEM_FAILED"})
 
 def _utc_day(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def cash_identity_gap(market: MarketPosition) -> Decimal:
+    """cash - (proceeds + merged + redeemed - split_size). Zero when every leg was booked."""
+    return market.cash - (market.proceeds + market.merged + market.redeemed - market.split_size)
 
 
 @dataclass
@@ -80,7 +90,15 @@ class Engine:
         self._log({"event": "transition", "slug": position.slug, "note": note})
 
     def open_count(self) -> int:
-        return sum(1 for market in self.markets.values() if market.phase not in {Phase.CLOSED, Phase.HALTED})
+        """Minted markets still holding tokens or an obligation on-chain.
+
+        Windows only DISCOVERED (every restart registers a few) hold nothing
+        and must not count toward `max_open_markets`.
+        """
+        return sum(
+            1 for market in self.markets.values()
+            if market.split_submitted and (market.phase in OPEN_PHASES or self.recoverable(market))
+        )
 
     def gross_exposure(self) -> Decimal:
         total = Decimal("0")
@@ -143,7 +161,13 @@ class Engine:
         market.pnl_booked = True
         self.risk_state.realized_pnl_today += market.cash
         self._log({"event": "cycle_closed", "slug": market.slug, "cash": str(market.cash),
+                   "proceeds": str(market.proceeds), "sold_up": str(market.sold_up), "sold_down": str(market.sold_down),
+                   "merged": str(market.merged), "redeemed": str(market.redeemed),
+                   "split_size": str(market.split_size), "winner": market.winner,
                    "realized_today": str(self.risk_state.realized_pnl_today), "day": self.pnl_day})
+        gap = cash_identity_gap(market)
+        if gap != 0:
+            self._log({"event": "pnl_mismatch", "slug": market.slug, "gap": str(gap), "cash": str(market.cash)})
 
     def daily_loss_breached(self) -> bool:
         return self.risk_state.realized_pnl_today <= -self.config.risk.max_daily_loss
@@ -194,6 +218,11 @@ class Engine:
         upcoming = current + strategy.window_seconds
         trio = (upcoming, current, previous)
         fair = self._fair(now, current, spot, beat, sigma)
+        edge = quote_edge(
+            strategy,
+            sigma if sigma is not None else sigma_per_second(strategy.fair_vol_annual),
+            current + strategy.window_seconds - now,
+        )
         for start in trio:
             if start <= 0:
                 continue
@@ -211,6 +240,7 @@ class Engine:
                     resolved=resolved if ended else False,
                     winner=winner if ended else None,
                     fair=fair if live else None,
+                    edge=edge,
                 )
             )
         # Older markets still holding tokens: the oracle came in after the
@@ -264,6 +294,7 @@ class Engine:
         resolved: bool,
         winner: str | None,
         fair: Decimal | None = None,
+        edge: Decimal | None = None,
     ) -> list[Action]:
         strategy = self.config.strategy
         actions: list[Action] = []
@@ -284,7 +315,7 @@ class Engine:
             self._transition(market, Phase.FLATTEN_PENDING, "window_closed")
 
         if market.phase is Phase.QUOTING and quoting_open(now, market.start, strategy):
-            actions.extend(self._refresh_quotes(market, now, book, last_up_trade, fair))
+            actions.extend(self._refresh_quotes(market, now, book, last_up_trade, fair, edge))
 
         recover = self.recoverable(market)
         if (
@@ -320,7 +351,7 @@ class Engine:
             return self.halt(market, "MAX_DAILY_LOSS")
         if amount > self.config.risk.max_position_per_outcome:
             return self.halt(market, "MAX_POSITION")
-        if self.open_count() > self.config.risk.max_open_markets:
+        if self.open_count() >= self.config.risk.max_open_markets:
             return self.halt(market, "MAX_OPEN_MARKETS")
         if self.gross_exposure() + amount > self.config.risk.max_total_exposure:
             return self.halt(market, "MAX_TOTAL_EXPOSURE")
@@ -348,6 +379,7 @@ class Engine:
         book: BookTop | None,
         last_up_trade: Decimal | None,
         fair: Decimal | None = None,
+        edge: Decimal | None = None,
     ) -> list[Action]:
         actions: list[Action] = []
         if book is None and last_up_trade is None:
@@ -367,12 +399,25 @@ class Engine:
         if strategy.fair_edge > 0 and fair is None:
             # U6 is on but spot (or the price to beat) is missing or stale.
             # Quoting off the touch alone is the behaviour the replay measured
-            # at -22 per window; rest nothing until the reference is back.
+            # at -22 per window; place nothing new until the reference is
+            # back. Asks already resting are held for a short grace so a
+            # quiet second on the spot feed does not cost the queue position.
             self.risk_state.data_stale = True
+            if market.spot_lost_since is None:
+                market.spot_lost_since = now
+            held = now - market.spot_lost_since
+            if held < strategy.spot_stale_grace_seconds and any(o.live for o in market.orders.values()):
+                actions.append(Action("QUOTES_HELD", market.slug, {"reason": "spot_grace", "seconds": held}))
+                return actions
             self._cancel_all(market, "no_spot_reference")
             actions.append(Action("QUOTES_PULLED", market.slug, {"reason": "no_spot_reference"}))
             return actions
+        market.spot_lost_since = None
         self.risk_state.data_stale = False
+        if in_final_pause(now, market.start, strategy):
+            self._cancel_all(market, "final_pause")
+            actions.append(Action("QUOTES_PULLED", market.slug, {"reason": "final_pause"}))
+            return actions
         ref = reference_up(book, last_up_trade)
         if ref is None:
             return actions
@@ -383,14 +428,16 @@ class Engine:
         tick = (book.tick if book is not None and book.tick else None) or strategy.price_tick
         live = {order.outcome: order for order in market.orders.values() if order.live and order.side is Side.SELL}
         # Pair-balance cap: withdraw the ask on the side that has run ahead.
-        blocked = frozenset(o for o in ("Up", "Down") if lean_blocked(o, market.up, market.down, strategy))
-        for outcome in blocked:
-            current = live.pop(outcome, None)
-            if current is not None:
-                current.live = False
-                self._log({"event": "cancel", "slug": market.slug, "order_id": current.order_id, "reason": "lean_cap",
-                           "up": str(market.up), "down": str(market.down)})
-                actions.append(Action("CANCEL", market.slug, {"order_id": current.order_id, "reason": "lean_cap"}))
+        # The fill cooldown (H4) withdraws a side that has just been hit.
+        withheld: dict[str, str] = {}
+        for outcome in ("Up", "Down"):
+            if lean_blocked(outcome, market.up, market.down, strategy):
+                withheld[outcome] = "lean_cap"
+            elif in_fill_cooldown(now, market.last_fill_ts.get(outcome), strategy):
+                withheld[outcome] = "fill_cooldown"
+        for outcome, reason in withheld.items():
+            self._withdraw(market, live, outcome, reason, actions)
+        blocked = frozenset(withheld)
         # Size each ask off inventory not already committed to another sell the
         # exchange may still fill. The ask being replaced is excluded: its
         # cancel goes out before the new ask, and if it fills first the
@@ -409,9 +456,23 @@ class Engine:
             tick=book.tick if book is not None else None,
             skip=blocked,
             fair=fair,
+            edge=edge,
         )
         if fair is not None:
             market.last_fair = fair
+        # H1: an ask resting well above its own touch only fills when the
+        # touch runs through it, i.e. on the adverse move.
+        touches = {
+            "Up": quantize_price(ref, tick),
+            "Down": strategy.complement_sum - book.bid if book is not None and book.bid is not None else None,
+        }
+        kept = []
+        for order in desired:
+            if rests_above_touch(order.price, touches[order.outcome], tick, strategy):
+                self._withdraw(market, live, order.outcome, "above_touch", actions)
+                continue
+            kept.append(order)
+        desired = kept
         for order in desired:
             # The per-order deviation check compares the order with the
             # reference for *its own* outcome. The Down reference is the
@@ -495,6 +556,7 @@ class Engine:
             market.up -= overlap
             market.down -= overlap
             market.cash += overlap
+            market.merged += overlap
             self._transition(market, Phase.REDEEM_PENDING, "merged_overlap")
             detail = {
                 "method": "MERGE",
@@ -522,13 +584,13 @@ class Engine:
             if market.phase is not Phase.REDEEM_PENDING:
                 self._transition(market, Phase.REDEEM_PENDING, "waiting_for_resolution")
             return Action("REDEEM_WAIT", market.slug, {"reason": "unresolved"})
-        amount = market.inventory(market.winner)
-        if amount >= self.config.strategy.dust_shares:
+        held = market.inventory(market.winner)
+        amount = held if held >= self.config.strategy.dust_shares else Decimal("0")
+        if amount > 0:
             market.add(market.winner, -amount)
             market.cash += amount
+            market.redeemed += amount
         # Loser tokens are left in place. That matches redeem-only markets.
-        self._transition(market, Phase.CLOSED, "redeemed_winner")
-        self._book_cycle(market)
         detail = {
             "method": "REDEEM",
             "winner": market.winner,
@@ -537,7 +599,13 @@ class Engine:
             "rule": "redeem_winner_abandon_loser",
             "cash": str(market.cash),
         }
+        if amount == 0:
+            detail["dust"] = str(held)
+        # Logged before the CLOSED transition and cycle_closed so a replay of
+        # the log has the redeemed cash in hand when it meets the booked total.
         self._log({"event": "redeem", "slug": market.slug, "ts": now, **detail})
+        self._transition(market, Phase.CLOSED, "redeemed_winner")
+        self._book_cycle(market)
         return Action("REDEEM", market.slug, detail)
 
     def apply_fill(
@@ -567,6 +635,13 @@ class Engine:
         order.filled += size
         market.add(order.outcome, -size)
         market.cash += size * price
+        market.proceeds += size * price
+        if order.outcome == "Up":
+            market.sold_up += size
+        else:
+            market.sold_down += size
+        if ts is not None:
+            market.last_fill_ts[order.outcome] = ts
         if order.remaining <= Decimal("0.000001"):
             order.live = False
             # Nothing is resting on the exchange any more; there is nothing to
@@ -589,6 +664,17 @@ class Engine:
         self._log({"event": "fill", "slug": market.slug, **detail})
         return Action("FILL", market.slug, detail)
 
+    def _withdraw(
+        self, market: MarketPosition, live: dict[str, WorkingOrder], outcome: str, reason: str, actions: list[Action]
+    ) -> None:
+        current = live.pop(outcome, None)
+        if current is None:
+            return
+        current.live = False
+        self._log({"event": "cancel", "slug": market.slug, "order_id": current.order_id, "reason": reason,
+                   "up": str(market.up), "down": str(market.down)})
+        actions.append(Action("CANCEL", market.slug, {"order_id": current.order_id, "reason": reason}))
+
     def _cancel_all(self, market: MarketPosition, reason: str) -> None:
         for order in market.orders.values():
             if order.live:
@@ -610,6 +696,11 @@ class Engine:
                     "up": str(market.up),
                     "down": str(market.down),
                     "cash": str(market.cash),
+                    "proceeds": str(market.proceeds),
+                    "sold_up": str(market.sold_up),
+                    "sold_down": str(market.sold_down),
+                    "merged": str(market.merged),
+                    "redeemed": str(market.redeemed),
                     "split_submitted": market.split_submitted,
                     "flatten_done": market.flatten_done,
                     "winner": market.winner,
@@ -655,6 +746,11 @@ class Engine:
                 up=Decimal(row["up"]),
                 down=Decimal(row["down"]),
                 cash=Decimal(row["cash"]),
+                proceeds=Decimal(row.get("proceeds") or "0"),
+                sold_up=Decimal(row.get("sold_up") or "0"),
+                sold_down=Decimal(row.get("sold_down") or "0"),
+                merged=Decimal(row.get("merged") or "0"),
+                redeemed=Decimal(row.get("redeemed") or "0"),
                 split_submitted=bool(row["split_submitted"]),
                 flatten_done=bool(row["flatten_done"]),
                 winner=row.get("winner"),

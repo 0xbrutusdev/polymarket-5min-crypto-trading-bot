@@ -55,7 +55,7 @@ def test_simulation_screen_without_events_is_calm():
     book = Book()
     text = snapshot_text(build(book, mode="SIMULATION", status="sim", log_path="p", emergency=False, clock=BASE + 5))
     assert "SIMULATION" in text and "no minted window" in text and "none resting" in text
-    assert "no events yet" in text and "simulated" in text
+    assert "no events yet" in text and "real taker prints" in text and "modelled queue" in text
 
 
 def test_emergency_and_halt_are_loud():

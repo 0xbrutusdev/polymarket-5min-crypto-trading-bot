@@ -100,8 +100,21 @@ class MarketPosition:
     # Spot-implied P(Up) used for the last quote refresh (None when U6 is off).
     last_fair: Decimal | None = None
     last_book_ts: int | None = None
+    # First tick at which the spot reference went missing while quoting; the
+    # resting asks are held for `spot_stale_grace_seconds` from here.
+    spot_lost_since: int | None = None
     halt_reason: str | None = None
     pnl_booked: bool = False
+    # Cash legs, so a closed cycle can be checked against
+    # proceeds + merged + redeemed - split_size == cash.
+    proceeds: Decimal = Decimal("0")
+    sold_up: Decimal = Decimal("0")
+    sold_down: Decimal = Decimal("0")
+    merged: Decimal = Decimal("0")
+    redeemed: Decimal = Decimal("0")
+    # Last fill time per outcome (H4 cooldown). Not persisted: a restart
+    # simply starts without a cooldown.
+    last_fill_ts: dict[str, int] = field(default_factory=dict)
     transitions: list[str] = field(default_factory=list)
 
     def inventory(self, outcome: str) -> Decimal:
