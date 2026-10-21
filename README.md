@@ -1,4 +1,4 @@
-# spork30
+# Polymarket market maker bot - reverse engineered from [spork30](https://polymarket.com/profile/0x1dd2a69e73ba444ecd5d87f0073d51a670ad51c2)
 
 <div align="center">
 
@@ -11,14 +11,14 @@
 
 > **One window. Two post-only asks. Nothing is sent until live mode is armed.**
 > Mint a complete set, rest a sell on Up and a sell on Down, merge what is left, redeem the unpaired winner.
+This repo is an independent bot. Its rules were reverse engineered from the public activity of the Polymarket account [spork30](https://polymarket.com/profile/0x1dd2a69e73ba444ecd5d87f0073d51a670ad51c2) (`0x1dd2a69e73ba444ecd5d87f0073d51a670ad51c2`): when it mints, how big the clips are, where the asks sit, and when it merges and redeems. That address is a reference tape. It is not this repo's wallet, and this project is not affiliated with that account.
 
 <br/>
 
 **[Quick start](#quick-start) · [The window](#the-window) · [Pricing](#how-the-asks-are-priced) · [Engine](#engine) · [Safety](#safety) · [Run](#run) · [Configuration](#configuration)**
 
-Account [spork30](https://polymarket.com/profile/0x1dd2a69e73ba444ecd5d87f0073d51a670ad51c2) · `0x1dd2a69e73ba444ecd5d87f0073d51a670ad51c2`
-
 </div>
+
 
 ---
 
@@ -44,7 +44,7 @@ python -m spork30.dashboard
 </td>
 <td width="50%" valign="top">
 
-### Check the account, send nothing
+### Check your wallet, send nothing
 
 Authenticates and reads collateral. The order loop is a separate flag.
 
@@ -69,12 +69,14 @@ Each `btc-updown-5m` market lasts 300 seconds. Settlement compares the 60-second
 
 The bot only makes. Every quote is a post-only sell. A price that would cross the bid is not sent.
 
+The clock below is what showed up on the reference account's public tape (2,012 settled windows, Oct 5–12 2026), not a schedule that account published.
+
 | # | Step | What happens | When |
 |---|------|----------------|------|
 | 1 | **Mint** | Split 750 USDC into 750 Up and 750 Down. A slug is split once. | 293 s before the open |
 | 2 | **Quote** | Rest a maker ask on Up and a maker ask on Down. | open until close |
 | 3 | **Stay paired** | Pull the ask on a side that has run more than 3 shares ahead, until the other side catches up. | while quoting |
-| 4 | **Merge** | Merge every remaining pair back to USDC, before the oracle is in. 1,953 of 2,012 windows on that tape. | +358 s |
+| 4 | **Merge** | Merge every remaining pair back to USDC, before the oracle is in. 1,953 of 2,012 windows on the reference tape. | +358 s |
 | 5 | **Redeem** | Redeem the unpaired winner. | +366 s |
 
 A stale book, a missing spot price, or the emergency-stop file pulls quotes. The bot does not invent a price.
@@ -218,7 +220,7 @@ The first `audit` run freezes the window list in `data/backtest/audit-dataset.js
 
 ### Reference account
 
-`spork30/reference.py` pulls the account's public activity (read-only, cached under `data/reference/`), rebuilds every window it traded, and lines its fills up next to a replay of this bot on the same windows.
+[spork30](https://polymarket.com/profile/0x1dd2a69e73ba444ecd5d87f0073d51a670ad51c2) is the public account this strategy was reconstructed from. It is not operated by this repo. `spork30/reference.py` reads that account's public activity only (cached under `data/reference/`), rebuilds every window it traded, and lines those fills up next to a replay of this bot on the same windows.
 
 ```bash
 python -m spork30.reference fetch --days 10
@@ -292,5 +294,5 @@ Risk limits are not part of the measured policy. They sit outside it so a bug ca
 
 ## Disclaimer
 
-> Trading prediction markets uses real funds once live mode is armed. This software is research code, published so the policy can be read and run. It is not financial advice, and it carries no warranty. Test in simulation before `python -m spork30.live --run`. Past windows, the account's own tape, and any replay are not a forecast. You are responsible for the keys, the size, and the loss.
+> Trading prediction markets uses real funds once live mode is armed. This software is an independent reconstruction of a public account's visible behavior. It is not that account, not affiliated with it, and not financial advice. It carries no warranty. Test in simulation before `python -m spork30.live --run`. The reference tape and any replay are not a forecast. You are responsible for the keys, the size, and the loss.
 
