@@ -63,31 +63,6 @@ Optional overrides go in `spork30/.env`, which is gitignored. A variable already
 
 ---
 
-## By the numbers
-
-Measured on the account's Oct 5–12 2026 tape (2,012 settled windows). These are the defaults in `StrategyConfig`.
-
-<div align="center">
-
-| Window | Mint | Quote | Flatten |
-|:---:|:---:|:---:|:---:|
-| **300 s** | **750 / 750** | **post-only asks** | **merge +358 s, redeem +366 s** |
-
-</div>
-
-| | |
-|---|---|
-| **Lead** | 293 s before the open (still mints down to 90 s; later than that, the window is skipped) |
-| **Clips** | 5, 10, 15, 20 shares — about 33%, 42%, 23%, 2% of fills |
-| **Lean** | pull a side once it is 3 shares ahead (the account's own median lean is about 6) |
-| **Edge** | spot-implied fair + 0.03, never through the touch |
-| **Rebate** | about 42 bps of sold notional, shown as an estimate; the bot never sees the payment |
-| **Spot** | Binance BTCUSDT; a quote is refused when spot is older than 1.5 s |
-
-Past windows, including this tape and any replay, are a measurement of that period. They are not a forecast.
-
----
-
 ## The window
 
 Each `btc-updown-5m` market lasts 300 seconds. Settlement compares the 60-second Chainlink TWAP at the close with the window's price to beat (the TWAP open). Up pays $1 if the close is at or above that open. Down pays $1 otherwise. One Up token plus one Down token is always worth $1, so the bot can mint both by splitting USDC and later merge a pair back into USDC.
