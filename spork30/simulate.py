@@ -26,6 +26,7 @@ import os
 import threading
 import time
 from decimal import Decimal
+from pathlib import Path
 
 from spork30.backtest import fetch_spot
 from spork30.config import AppConfig
@@ -520,6 +521,64 @@ def run_wall_clock(stop: threading.Event, chainlink: SpotCache, config: AppConfi
         sim.close()
 
 
+def stop_file_for(config: AppConfig) -> Path:
+    """`<BOT_DATA_DIR>/STOP`: touching it ends a headless run cleanly."""
+    return Path(config.state_path).parent.parent / "STOP"
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Headless simulation, so several variants can run side by side, each
+    with its own BOT_DATA_DIR and knobs, and be scored with
+    `python -m spork30.reference simcompare`."""
+    import argparse
+
+    from spork30.config import load_config, reset_runtime
+
+    parser = argparse.ArgumentParser(description="Run the simulation without a screen")
+    parser.add_argument("--hours", type=float, default=0, help="stop after this long; 0 runs until the STOP file")
+    parser.add_argument("--init", action="store_true", help="clear this data dir's decision log and state first")
+    parser.add_argument("--stop-file", default="", help="default <BOT_DATA_DIR>/STOP")
+    args = parser.parse_args(argv)
+    config = load_config()
+    if config.live_enabled:
+        raise SystemExit("spork30.simulate runs in SIMULATION only; set TRADING_MODE=SIMULATION")
+    if args.init:
+        reset_runtime(config)
+    stop_file = Path(args.stop_file) if args.stop_file else stop_file_for(config)
+    if stop_file.exists():
+        stop_file.unlink()
+    s = config.strategy
+    print(f"simulation -> {config.decision_log_path}  mode {s.quote_mode} fair_edge {s.fair_edge} "
+          f"lean {s.max_lean_shares} clamp {int(s.lean_size_clamp)} rebalance {int(s.rebalance_at_touch)} "
+          f"requote {s.requote_min_seconds}s/{s.requote_threshold_ticks}t sticky {int(s.sticky_clip)} "
+          f"underdog {s.underdog_min_price} jump_pause {config.risk.jump_pause_seconds}s "
+          f"queue {queue_ahead_from_env()}", flush=True)
+    deadline = time.time() + args.hours * 3600 if args.hours > 0 else None
+    stop = threading.Event()
+    chainlink = SpotCache()
+    errors: list[str] = []
+
+    def work() -> None:
+        try:
+            run_wall_clock(stop, chainlink, config)
+        except Exception as exc:  # reported below; the run ends
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    worker = threading.Thread(target=work, name="simulation", daemon=True)
+    worker.start()
+    try:
+        while worker.is_alive():
+            if stop_file.exists() or (deadline is not None and time.time() >= deadline):
+                break
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    stop.set()
+    worker.join(timeout=15)
+    chainlink.close()
+    print(f"stopped: {errors[0]}" if errors else "done", flush=True)
+
+
 def advance_to_now(chainlink: SpotCache, config: AppConfig) -> None:
     """One catch-up to the current second, for a single printed frame."""
     sim = Simulation(config, chainlink=chainlink, spot_feed=SpotFeed(start=False), tape=PrintTape(start=False),
@@ -531,3 +590,7 @@ def advance_to_now(chainlink: SpotCache, config: AppConfig) -> None:
         sim.catch_up(begin, now)
     finally:
         sim.close()
+
+
+if __name__ == "__main__":
+    main()

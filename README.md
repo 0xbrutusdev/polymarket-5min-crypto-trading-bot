@@ -97,6 +97,14 @@ python -m spork30.dashboard
 
 What the simulation measures is stated on its health pane: the prints, their prices, sizes and the top of book are real; the queue position is modelled (the print-implied touch stands in only while the book poll is down). Before Oct 15 2026 the simulation filled a synthetic 5 shares every 20 s on whichever side BTC was moving toward; the losses in logs from before then measure that construction, not the strategy (see `docs/audit-2026-10.md`). Until later that day its touch came from the lagging print tape and every stale spot tick cancelled both asks (see `docs/reference-gap-2026-10.md`).
 
+Headless, for comparing variants side by side (each with its own `BOT_DATA_DIR`; touching `<BOT_DATA_DIR>/STOP` ends a run):
+
+```powershell
+$env:TRADING_MODE="SIMULATION"; $env:BOT_DATA_DIR="data/backtest/ab-touch"; $env:QUOTE_MODE="touch"
+python -m spork30.simulate --hours 24 --init
+.\scripts\ab-sim.ps1 -Hours 24     # the five reference-gap variants at once; -Stop ends them
+```
+
 In live mode the dashboard starts the order loop in the same process. To watch a loop that is already running:
 
 ```bash
@@ -134,7 +142,10 @@ The strategy is forked from the maker account `0x1dd2a69e73ba444ecd5d87f0073d51a
 python -m spork30.reference fetch --days 10
 python -m spork30.reference profile --windows-json data/reference/windows.json
 python -m spork30.reference align --queue 250 --lag 1
+python -m spork30.reference simcompare --log data/backtest/ab-touch/sim/decisions.jsonl --baseline data/backtest/ab-baseline/sim/decisions.jsonl
 ```
+
+`simcompare` scores a simulation decision log against the account on the windows both settled: volume, one-sided windows, matched-pair versus leftover PnL, late-fill share, sold-winner, PnL by price and by minute, and (with `--baseline`) the paired improvement over another log with a block-bootstrap interval. It ends with the acceptance checks a default change has to pass.
 
 The Oct 2026 comparison and what it changed are in `docs/reference-gap-2026-10.md`.
 
@@ -163,7 +174,7 @@ python -m spork30.live --run    # sign and run the loop
 
 `--init` clears the live decision log and engine state. It does not touch the emergency-stop file.
 
-`--run` also refuses to start when `FAIR_EDGE` is 0 (touch quoting replayed at -12.4 USDC per window on 288 out-of-sample windows; `ALLOW_TOUCH_QUOTING=YES` overrides), or when the funder holds less USDC than `SPLIT_SIZE` and there is no open market left to unwind. The check-only run prints the same preflight.
+`--run` also refuses to start when quoting the touch (`QUOTE_MODE=touch` or `FAIR_EDGE=0`) until `ALLOW_TOUCH_QUOTING=YES` is set: the replay scored it at -12.4 USDC per window but cannot price a touch quoter, and it has not been validated against a real book yet, or when the funder holds less USDC than `SPLIT_SIZE` and there is no open market left to unwind. The check-only run prints the same preflight.
 
 Splits, merges, and redeems go through Polymarket’s gasless relayer and need builder credentials (`POLYMARKET_BUILDER_API_KEY`, `POLYMARKET_BUILDER_SECRET`, `POLYMARKET_BUILDER_PASSPHRASE`). Orders are post-only on the CLOB. On exit the loop cancels every order it still believes is live.
 
@@ -184,14 +195,22 @@ Defaults are the policy above. Set any of these in the environment or in `spork3
 | `REDEEM_DELAY_SECONDS` | `366` | Redeem the unpaired winner |
 | `FAIR_EDGE` | `0.03` | Cents added to spot-implied fair. `0` quotes the touch |
 | `FAIR_UNDERCUT` | off | Allow the fair ask to step inside the touch |
-| `ALLOW_TOUCH_QUOTING` | unset | `YES` lets `--run` start with `FAIR_EDGE=0` |
+| `ALLOW_TOUCH_QUOTING` | unset | `YES` lets `--run` start with `QUOTE_MODE=touch` or `FAIR_EDGE=0` |
+| `QUOTE_MODE` | `fair` | `fair` prices at fair + edge; `touch` joins the Polymarket touch on both sides, as the reference account does |
+| `FAIR_GUARD_TICKS` | `0` | Touch mode: withhold an ask while it sells this many ticks or more under its spot fair. `0` disables |
+| `LEAN_SIZE_CLAMP` | off | Clamp each clip so a fill cannot take the lean past `MAX_LEAN_SHARES` (needs `MAX_LEAN_SHARES` >= 5) |
+| `REBALANCE_AT_TOUCH` | off | While one side has been sold ahead, the lagging side joins its touch so the pair completes |
+| `STICKY_CLIP` | off | Keep an ask's clip size when it is replaced instead of drawing a new one |
+| `UNDERDOG_MIN_PRICE` | `0` | Do not sell an outcome below this price. `0` disables |
+| `JUMP_PAUSE_SECONDS` | `0` | On a jump over 0.50, pull quotes this long and resume instead of halting the window. `0` halts |
+| `MAX_JUMPS_PER_WINDOW` | `3` | With the pause on, halt the window on this many jumps |
 | `SPOT_LAG_SECONDS` | `1` | Spot age assumed by the replay |
 | `FAIR_VOL_ANNUAL` | `0.45` | Vol used when realised vol cannot be measured |
 | `MAX_LEAN_SHARES` | `3` | Pull an ask once that side is this far ahead. `0` disables |
 | `ASK_OFFSET_TICKS` | `0` | Ticks behind the touch. `0` joins the ask |
 | `IMPROVE_SPREAD_TICKS` | `0` | Step inside a wide spread. `0` disables |
-| `REQUOTE_THRESHOLD_TICKS` | `0` | Minimum touch move before a replace |
-| `REQUOTE_MIN_SECONDS` | `0` | Minimum resting age before a replace |
+| `REQUOTE_THRESHOLD_TICKS` | `0` | Minimum move away from the ask before a replace. A move up (the ask now under the market) always replaces at once |
+| `REQUOTE_MIN_SECONDS` | `0` | Minimum resting age before a replace, for moves away from the ask |
 | `MAKER_REBATE_BPS` | `42` | Rebate estimate on the screen and in the replay |
 | `FAIR_GAP_WITHHOLD_TICKS` | `0` | Withhold an ask that would rest this many ticks or more above its touch. `1` only ever joins the touch. `0` disables |
 | `QUOTE_PAUSE_FINAL_SECONDS` | `0` | Pull both asks for the last N seconds of the window. `0` disables |

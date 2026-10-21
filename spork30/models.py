@@ -115,6 +115,10 @@ class MarketPosition:
     # Last fill time per outcome (H4 cooldown). Not persisted: a restart
     # simply starts without a cooldown.
     last_fill_ts: dict[str, int] = field(default_factory=dict)
+    # Price-jump pause: quoting resumes at this engine second, and the number
+    # of jumps seen this window. Not persisted either.
+    jump_paused_until: int | None = None
+    jumps: int = 0
     transitions: list[str] = field(default_factory=list)
 
     def inventory(self, outcome: str) -> Decimal:

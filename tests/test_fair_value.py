@@ -82,9 +82,11 @@ def test_should_requote_rules():
     assert not should_requote(Decimal("0.52"), Decimal("0.52"), 0, TICK, off)
     assert should_requote(Decimal("0.52"), Decimal("0.53"), 0, TICK, off)
     held = StrategyConfig(requote_threshold_ticks=2, requote_min_seconds=10)
-    assert not should_requote(Decimal("0.52"), Decimal("0.53"), 30, TICK, held)  # one tick: hold
-    assert should_requote(Decimal("0.52"), Decimal("0.54"), 30, TICK, held)
-    assert not should_requote(Decimal("0.52"), Decimal("0.60"), 5, TICK, held)  # too young
+    assert not should_requote(Decimal("0.52"), Decimal("0.51"), 30, TICK, held)  # one tick away: hold
+    assert should_requote(Decimal("0.52"), Decimal("0.50"), 30, TICK, held)
+    assert not should_requote(Decimal("0.52"), Decimal("0.44"), 5, TICK, held)  # too young
+    # A move up leaves the ask under the market: replaced at once, young or not.
+    assert should_requote(Decimal("0.52"), Decimal("0.53"), 0, TICK, held)
 
 
 def test_lean_blocked_withdraws_the_side_that_ran_ahead():

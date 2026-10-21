@@ -221,14 +221,16 @@ def run_live(stop: threading.Event | None = None, quiet: bool = False) -> None:
     # The fair value needs ~60 s of spot before a window to measure its beat,
     # so the feed is opened before the loop; the first window after start
     # quotes only once that history exists.
-    spot_feed = SpotFeed() if config.strategy.fair_edge > 0 else None
+    strategy = config.strategy
+    wants_fair = strategy.fair_edge > 0 or (strategy.quote_mode == "touch" and strategy.fair_guard_ticks > 0)
+    spot_feed = SpotFeed() if wants_fair else None
     if not quiet:
         print(
-            f"live loop split {config.strategy.split_size} "
-            f"lead {config.strategy.split_lead_seconds}s "
-            f"redeem {config.strategy.redeem_delay_seconds}s "
-            f"merge {config.strategy.flatten_delay_seconds}s "
-            f"fair_edge {config.strategy.fair_edge} lean_cap {config.strategy.max_lean_shares}",
+            f"live loop split {strategy.split_size} "
+            f"lead {strategy.split_lead_seconds}s "
+            f"redeem {strategy.redeem_delay_seconds}s "
+            f"merge {strategy.flatten_delay_seconds}s "
+            f"mode {strategy.quote_mode} fair_edge {strategy.fair_edge} lean_cap {strategy.max_lean_shares}",
             flush=True,
         )
     try:

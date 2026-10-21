@@ -23,6 +23,8 @@ from spork30.strategy import (
     flatten_method,
     in_fill_cooldown,
     in_final_pause,
+    lagging_outcome,
+    lean_allowance,
     lean_blocked,
     market_slug,
     quantize_price,
@@ -270,7 +272,8 @@ class Engine:
         """Spot-implied P(Up) for the live window, or None when U6 is off or
         either input is missing (the quote then falls back to the touch)."""
         strategy = self.config.strategy
-        if strategy.fair_edge <= 0 or spot is None or beat is None or spot <= 0 or beat <= 0:
+        wanted = strategy.fair_edge > 0 or (strategy.quote_mode == "touch" and strategy.fair_guard_ticks > 0)
+        if not wanted or spot is None or beat is None or spot <= 0 or beat <= 0:
             return None
         seconds_left = current + strategy.window_seconds - now
         return fair_up(spot, beat, seconds_left, sigma if sigma is not None else sigma_per_second(strategy.fair_vol_annual))
@@ -396,7 +399,7 @@ class Engine:
                 actions.append(Action("QUOTES_PULLED", market.slug, {"reason": "stale_book", "age": age}))
                 return actions
         strategy = self.config.strategy
-        if strategy.fair_edge > 0 and fair is None:
+        if strategy.quote_mode == "fair" and strategy.fair_edge > 0 and fair is None:
             # U6 is on but spot (or the price to beat) is missing or stale.
             # Quoting off the touch alone is the behaviour the replay measured
             # at -22 per window; place nothing new until the reference is
@@ -421,7 +424,22 @@ class Engine:
         ref = reference_up(book, last_up_trade)
         if ref is None:
             return actions
-        if market.last_reference is not None and abs(ref - market.last_reference) > self.config.risk.max_price_jump:
+        risk = self.config.risk
+        if market.jump_paused_until is not None:
+            if now < market.jump_paused_until:
+                market.last_reference = ref
+                return actions
+            market.jump_paused_until = None
+        if market.last_reference is not None and abs(ref - market.last_reference) > risk.max_price_jump:
+            market.jumps += 1
+            if risk.jump_pause_seconds > 0 and market.jumps < risk.max_jumps_per_window:
+                self._cancel_all(market, "price_jump")
+                market.jump_paused_until = now + risk.jump_pause_seconds
+                self._log({"event": "jump_pause", "slug": market.slug, "ts": now, "from": str(market.last_reference),
+                           "to": str(ref), "seconds": risk.jump_pause_seconds, "jumps": market.jumps})
+                market.last_reference = ref
+                actions.append(Action("QUOTES_PULLED", market.slug, {"reason": "price_jump"}))
+                return actions
             actions.append(self.halt(market, "MAX_PRICE_DEVIATION"))
             return actions
         market.last_reference = ref
@@ -446,6 +464,13 @@ class Engine:
             outcome: market.resting(outcome, exclude=live[outcome].order_id if outcome in live else None)
             for outcome in ("Up", "Down")
         }
+        size_caps = {
+            outcome: cap
+            for outcome in ("Up", "Down")
+            if (cap := lean_allowance(outcome, market.up, market.down, reserved[outcome], strategy)) is not None
+        }
+        lagging = lagging_outcome(market.up, market.down, strategy)
+        sizes = {outcome: order.size for outcome, order in live.items()} if strategy.sticky_clip else None
         desired = desired_asks(
             up_reference=ref,
             inventory_up=market.up - reserved["Up"],
@@ -457,6 +482,9 @@ class Engine:
             skip=blocked,
             fair=fair,
             edge=edge,
+            at_touch=frozenset({lagging}) if lagging else frozenset(),
+            size_caps=size_caps or None,
+            sizes=sizes,
         )
         if fair is not None:
             market.last_fair = fair
@@ -480,6 +508,11 @@ class Engine:
             # before, made |price - reference| identically zero and the check
             # could never fire.)
             side_reference = ref if order.outcome == "Up" else self.config.strategy.complement_sum - ref
+            if order.touch_bid is not None and order.price <= order.touch_bid:
+                # The window is decided (the other ask is at the tick floor):
+                # a post-only sell here would cross. Skip it without a
+                # refusal record; ~30 of those per window were noise.
+                continue
             try:
                 checks = check_order(
                     now=now,

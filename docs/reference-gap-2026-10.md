@@ -258,6 +258,75 @@ but two things in the run are structural and show only against a real book:
   are risk settings outside the measured policy and are left as they are;
   the second is worth a look before a touch quoter goes live.
 
+## 7. Oct 16: where the simulation's loss sits, and the knobs added for it
+
+`python -m spork30.reference simcompare` on the default simulation
+(`data/runtime/sim`, 203 cycles over 17 h, fair edge 0.03, lean cap 3,
+requote 0/0), against the account's own tape on 2,811 windows:
+
+| | simulation | reference |
+|---|---|---|
+| fills / shares per window | 1.2 / 9.3 | 21 / 154 |
+| one-sided windows (of traded) | 104 of 131 (79%) | 24 of 2,811 |
+| matched-pair PnL | +1.32 | −2,453 |
+| leftover (unmatched lean) PnL | −31.80 | +3,487 |
+| sold winner | 44% | 48.6% |
+| late fills (cancelled ask hit by an earlier print) | 181 of 238, −36.78 | – |
+| places per window (median) | 95 | ~8 distinct prices per side |
+| market halted on a price jump | 26 of 203 windows | – |
+
+The whole loss is the unmatched lean. Two causes are mechanical:
+
+- The lean cap of 3 cannot hold with 5-20 share clips: the first fill takes
+  the lean to 10, which blocks that side, while the other side rests at
+  fair + 0.03 above its touch and rarely fills. The window settles as a
+  directional bet.
+- The engine replaces each ask every second or two; three quarters of its
+  fills are prints that met an ask it was already replacing, mostly cheap
+  asks after a move (asks under 0.20 sold the winner 35% of the time, the
+  reference's 10%).
+
+The account's sells by price: under 0.20 −0.005/share, 0.20-0.40 −0.017,
+0.40-0.60 +0.008, 0.60-0.80 +0.020, 0.80+ +0.009. By minute it is flat
+except minute 3 (−0.002). The loss per window, −0.15, is inside the
+account's own p10/p90 of −5/+5; the structural gap (volume, so rebate, and
+one-sided exposure) is what matters.
+
+Knobs added, all off by default (replay fingerprint at defaults unchanged):
+`QUOTE_MODE=touch`, `FAIR_GUARD_TICKS`, `LEAN_SIZE_CLAMP`,
+`REBALANCE_AT_TOUCH`, `STICKY_CLIP`, `UNDERDOG_MIN_PRICE`,
+`JUMP_PAUSE_SECONDS` / `MAX_JUMPS_PER_WINDOW`. Two changes apply at
+defaults: `should_requote` replaces an ask at once when the new price is
+above it (the ask is under the market; with the requote knobs at 0 it
+already did), and an ask that would cross is skipped without a
+`risk_refuse` record. The live preflight treats `QUOTE_MODE=touch` like
+`FAIR_EDGE=0` and still needs `ALLOW_TOUCH_QUOTING=YES`.
+
+Gate: `scripts/ab-sim.ps1` runs five headless simulations side by side
+(`python -m spork30.simulate --hours 24`), each in its own data dir:
+
+| variant | knobs |
+|---|---|
+| ab-baseline | defaults |
+| ab-touch | touch, rebalance, lean cap 6 with clamp, jump pause 5 s |
+| ab-touch-rq3 | ab-touch + requote 3 s / 1 tick + sticky clip |
+| ab-touch-rq10 | ab-touch + requote 10 s / 2 ticks + sticky clip |
+| ab-touch-rq3-dog | ab-touch-rq3 + underdog floor 0.35 |
+
+A default changes only if a variant passes, against the account on the same
+windows (`simcompare --baseline` prints the checks): one-sided windows under
+10%, sold-winner within 2 points, volume within 30%, cash + rebate per
+window above the baseline's with a paired block-bootstrap 95% interval
+excluding zero, and no window worse than −40.
+
+First reading after 6 windows per variant (noise, recorded for the shape
+only): touch mode sold 44 sh/w against the baseline's 19 and was one-sided
+in 40% of traded windows against 75%; the 10 s / 2 tick hold halved the
+replaces (375 vs 805), the 3 s / 1 tick hold barely moved them (681),
+because most remaining replaces are moves up, which are replaced at once by
+design. No variant is near the reference's 154 sh/w yet. Defaults stay as
+they are until the 24 h comparison is in.
+
 Assumption throughout: your account earns the maker rebate at the same
 42-43 bps. If it does not, the target is the cash leg alone (+0.29/w, worst
 window −40), and the volume argument weakens to the settlement edge.

@@ -124,15 +124,19 @@ def read_collateral(config: AppConfig) -> Decimal:
 def live_preflight(config: AppConfig, *, collateral: Decimal | None, open_markets: int) -> list[str]:
     """Reasons the live loop must not start. Empty means go.
 
-    Quoting off the Polymarket touch without the spot fair value replayed at
-    -12.4 USDC per window (t -28.7) on 288 windows it was not tuned on, Oct
-    12-13 2026; set ALLOW_TOUCH_QUOTING=YES to run it anyway. A split the
+    Quoting off the Polymarket touch (QUOTE_MODE=touch, or FAIR_EDGE=0)
+    replayed at -12.4 USDC per window on 288 windows, Oct 12-13 2026, but
+    the replay cannot price a touch quoter (docs/reference-gap-2026-10.md
+    §3.4), and the reference account sells the touch. It needs an explicit
+    ALLOW_TOUCH_QUOTING=YES until the simulation comparison passes. A split the
     funder cannot pay for reverts on the relayer and halts the window, so an
     empty wallet is refused unless there are open markets left to unwind.
     """
     problems: list[str] = []
-    if config.strategy.fair_edge <= 0 and os.environ.get("ALLOW_TOUCH_QUOTING") != "YES":
-        problems.append("FAIR_EDGE is 0: touch quoting lost 12.4 USDC per window out of sample")
+    touch = config.strategy.quote_mode == "touch" or config.strategy.fair_edge <= 0
+    if touch and os.environ.get("ALLOW_TOUCH_QUOTING") != "YES":
+        problems.append("touch quoting (QUOTE_MODE=touch or FAIR_EDGE=0) is not validated against a real book in "
+                        "live; set ALLOW_TOUCH_QUOTING=YES to opt in")
     if collateral is not None and collateral < config.strategy.split_size and open_markets == 0:
         problems.append(f"collateral {collateral.quantize(Decimal('0.01'))} USDC is below SPLIT_SIZE {config.strategy.split_size}")
     return problems

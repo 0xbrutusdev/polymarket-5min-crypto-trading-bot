@@ -22,6 +22,13 @@ def _decimal(name: str, default: str) -> Decimal:
     return Decimal(os.environ.get(name, default))
 
 
+def _flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     return default if raw is None or raw == "" else int(raw)
@@ -128,6 +135,33 @@ class StrategyConfig:
     # H4 After a fill on one outcome, withhold that outcome's ask for N
     # seconds so one sweep cannot take several clips in a row. 0 = off.
     fill_cooldown_seconds: int = 0
+    # --- Reference-gap knobs (Oct 16 2026), each off by default. On 203
+    # simulated cycles 104 of 131 traded windows sold one side only; matched
+    # pairs made +1.32 and the unmatched lean -31.80. The reference account
+    # had 24 one-sided windows in 2,811. See docs/reference-gap-2026-10.md.
+    #
+    # Clamp each clip so a fill can never take the lean past
+    # `max_lean_shares`. With clips of 5-20 and a cap of 3 the first fill
+    # already overshot the cap. Needs max_lean_shares >= min_order_size.
+    lean_size_clamp: bool = False
+    # While one outcome has been sold ahead, the lagging outcome joins its
+    # touch instead of resting at fair + edge, so the pair completes.
+    rebalance_at_touch: bool = False
+    # "fair" prices both asks at fair + edge (U6). "touch" joins the
+    # Polymarket touch on both sides, the way the reference account sells;
+    # the fair value is still computed when spot is available, for the guard.
+    quote_mode: str = "fair"
+    # Touch mode only: withhold an outcome's ask while the spot fair for that
+    # outcome is this many ticks or more above the ask (selling it far under
+    # fair). The reference made money selling 3+ ticks under fair, so 0 = off.
+    fair_guard_ticks: int = 0
+    # Keep a replaced ask's clip size instead of drawing a new one each time
+    # the price moves.
+    sticky_clip: bool = False
+    # Do not sell an outcome below this price. On the reference tape asks
+    # under 0.40 settled at -0.017/share and above 0.60 at +0.009 to +0.020.
+    # 0 = off.
+    underdog_min_price: Decimal = Decimal("0")
     # Maker rebate as measured on the account's seven daily MAKER_REBATE
     # payments: 41-43 bps of sold notional (64 on one day). Used for the
     # estimate on the screen and in the replay; the bot never sees the
@@ -160,6 +194,12 @@ class RiskConfig:
     stale_data_timeout_seconds: int = 5
     # Halt if a reference price jumps by more than this in one update.
     max_price_jump: Decimal = Decimal("0.50")
+    # On a jump larger than `max_price_jump`, pull the quotes for this many
+    # seconds and then resume, instead of halting the market for the rest of
+    # the window (26 of 203 simulated windows). 0 = halt, the old behaviour.
+    jump_pause_seconds: int = 0
+    # With the pause on, the market still halts on this many jumps in one window.
+    max_jumps_per_window: int = 3
     min_price: Decimal = Decimal("0.001")
     max_price: Decimal = Decimal("0.999")
 
@@ -206,6 +246,14 @@ def load_config() -> AppConfig:
     # so those lines are not shown as exchange trades.
     root = os.path.join(base, "live" if mode is TradingMode.LIVE else "sim")
     defaults = StrategyConfig()
+    quote_mode = os.environ.get("QUOTE_MODE", defaults.quote_mode).strip().lower()
+    if quote_mode not in {"fair", "touch"}:
+        raise SystemExit(f"QUOTE_MODE must be fair or touch, got {quote_mode!r}")
+    lean_clamp = _flag("LEAN_SIZE_CLAMP", defaults.lean_size_clamp)
+    lean_cap = _decimal("MAX_LEAN_SHARES", str(defaults.max_lean_shares))
+    if lean_clamp and lean_cap < defaults.min_order_size:
+        raise SystemExit(f"LEAN_SIZE_CLAMP needs MAX_LEAN_SHARES >= {defaults.min_order_size}, got {lean_cap}; "
+                         "a smaller cap leaves no clip that fits")
     return AppConfig(
         trading_mode=mode,
         strategy=StrategyConfig(
@@ -217,7 +265,7 @@ def load_config() -> AppConfig:
             ask_offset_ticks=_int("ASK_OFFSET_TICKS", defaults.ask_offset_ticks),
             requote_threshold_ticks=_int("REQUOTE_THRESHOLD_TICKS", defaults.requote_threshold_ticks),
             requote_min_seconds=_int("REQUOTE_MIN_SECONDS", defaults.requote_min_seconds),
-            max_lean_shares=_decimal("MAX_LEAN_SHARES", str(defaults.max_lean_shares)),
+            max_lean_shares=lean_cap,
             improve_spread_ticks=_int("IMPROVE_SPREAD_TICKS", defaults.improve_spread_ticks),
             fair_edge=_decimal("FAIR_EDGE", str(defaults.fair_edge)),
             fair_undercut=os.environ.get("FAIR_UNDERCUT", "1" if defaults.fair_undercut else "0").strip() in {"1", "true", "yes", "on"},
@@ -229,6 +277,12 @@ def load_config() -> AppConfig:
             quote_pause_final_seconds=_int("QUOTE_PAUSE_FINAL_SECONDS", defaults.quote_pause_final_seconds),
             fair_edge_vol_mult=_decimal("FAIR_EDGE_VOL_MULT", str(defaults.fair_edge_vol_mult)),
             fill_cooldown_seconds=_int("FILL_COOLDOWN_SECONDS", defaults.fill_cooldown_seconds),
+            lean_size_clamp=lean_clamp,
+            rebalance_at_touch=_flag("REBALANCE_AT_TOUCH", defaults.rebalance_at_touch),
+            quote_mode=quote_mode,
+            fair_guard_ticks=_int("FAIR_GUARD_TICKS", defaults.fair_guard_ticks),
+            sticky_clip=_flag("STICKY_CLIP", defaults.sticky_clip),
+            underdog_min_price=_decimal("UNDERDOG_MIN_PRICE", str(defaults.underdog_min_price)),
         ),
         risk=RiskConfig(
             max_position_per_outcome=_decimal("MAX_POSITION", "800"),
@@ -239,6 +293,8 @@ def load_config() -> AppConfig:
             max_orders_per_10s=_int("MAX_ORDER_RATE", 40),
             max_retry_count=_int("MAX_RETRY_COUNT", 3),
             stale_data_timeout_seconds=_int("STALE_DATA_TIMEOUT", 5),
+            jump_pause_seconds=_int("JUMP_PAUSE_SECONDS", RiskConfig.jump_pause_seconds),
+            max_jumps_per_window=_int("MAX_JUMPS_PER_WINDOW", RiskConfig.max_jumps_per_window),
         ),
         state_path=os.path.join(root, "state.json"),
         decision_log_path=os.path.join(root, "decisions.jsonl"),

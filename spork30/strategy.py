@@ -203,9 +203,16 @@ def should_requote(
     market moved through fills where it was and is not immediately re-posted
     a tick higher. That re-posting is what sold the bot the winner at the
     leading edge of every move.
+
+    A move up (the new price is above the resting ask) is replaced at once,
+    whatever the knobs: the ask now sits under the market, and holding it is
+    what the late fills in the Oct 16 simulation were (76% of fills, -36.78).
+    The hysteresis only holds an ask the market has moved away from.
     """
     if current_price == new_price:
         return False
+    if new_price > current_price:
+        return True
     if age_seconds < strategy.requote_min_seconds:
         return False
     moved = abs(new_price - current_price) / tick
@@ -224,6 +231,32 @@ def lean_blocked(outcome: str, up: Decimal, down: Decimal, strategy: StrategyCon
         return False
     this, other = (up, down) if outcome == "Up" else (down, up)
     return other - this > cap
+
+
+def lean_allowance(outcome: str, up: Decimal, down: Decimal, resting: Decimal, strategy: StrategyConfig) -> Decimal | None:
+    """Shares `outcome` may still sell before it runs `max_lean_shares` ahead,
+    counting asks already resting on it as sold. None while `lean_size_clamp`
+    is off."""
+    if not strategy.lean_size_clamp or strategy.max_lean_shares <= 0:
+        return None
+    this, other = (up, down) if outcome == "Up" else (down, up)
+    return max(Decimal("0"), strategy.max_lean_shares - (other - this) - resting)
+
+
+def lagging_outcome(up: Decimal, down: Decimal, strategy: StrategyConfig) -> str | None:
+    """The outcome sold less (more inventory left), while `rebalance_at_touch` is on."""
+    if not strategy.rebalance_at_touch or up == down:
+        return None
+    return "Up" if up > down else "Down"
+
+
+def fair_guard_blocks(outcome: str, price: Decimal, fair: Decimal | None, tick: Decimal, strategy: StrategyConfig) -> bool:
+    """Touch mode: True when the ask sells `outcome` `fair_guard_ticks` or more
+    under its spot fair. Off at 0, in fair mode, or without a fair value."""
+    if strategy.quote_mode != "touch" or strategy.fair_guard_ticks <= 0 or fair is None:
+        return False
+    fair_outcome = fair if outcome == "Up" else Decimal("1") - fair
+    return (fair_outcome - price) / tick >= strategy.fair_guard_ticks
 
 
 def complement_asks(

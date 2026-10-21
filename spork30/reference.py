@@ -4,6 +4,7 @@ profile, and alignment of its real fills with the replay's modelled ones.
     python -m spork30.reference fetch --days 5
     python -m spork30.reference profile
     python -m spork30.reference align --queue 250 --lag 2 --json data/reference/align.json
+    python -m spork30.reference simcompare --log data/runtime/sim/decisions.jsonl [--baseline other/decisions.jsonl]
 
 Everything here is read-only against public endpoints (data-api.polymarket.com)
 and the local print cache. Nothing signs or sends.
@@ -540,6 +541,237 @@ def align(
     }
 
 
+# --- simulation log vs the reference ------------------------------------------------------------
+
+PRICE_BUCKETS = ((0.0, 0.2, "<0.20"), (0.2, 0.4, "0.20-0.40"), (0.4, 0.6, "0.40-0.60"),
+                 (0.6, 0.8, "0.60-0.80"), (0.8, 1.01, ">=0.80"))
+
+
+@dataclass
+class SimWindow:
+    """One settled simulation cycle rebuilt from a decision log."""
+
+    window: RefWindow
+    late_fills: int = 0
+    late_pnl: float = 0.0
+    places: int = 0
+
+
+def sim_windows(log_path: Path) -> list[SimWindow]:
+    """Settled cycles in a `decisions.jsonl`, as `RefWindow`s so both sides share the stats.
+
+    Cash, merged, redeemed and the winner come from `cycle_closed`; the trades
+    are the `fill` records. A window without `cycle_closed` is not settled and
+    is left out."""
+    by_slug: dict[str, SimWindow] = {}
+    fills: dict[str, list[dict]] = defaultdict(list)
+    places: Counter = Counter()
+    with open(log_path, encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            slug = str(r.get("slug") or "")
+            if not slug.startswith(SLUG_PREFIX):
+                continue
+            event = r.get("event")
+            if event == "fill":
+                fills[slug].append(r)
+            elif event == "place":
+                places[slug] += 1
+            elif event == "cycle_closed":
+                start = int(slug.rsplit("-", 1)[-1])
+                w = RefWindow(slug=slug, start=start, split_ts=start - 1, split_size=_dec(r.get("split_size")),
+                              merged=_dec(r.get("merged")), redeemed=_dec(r.get("redeemed")),
+                              winner=r.get("winner") if r.get("winner") in {"Up", "Down"} else None,
+                              winner_source="sim")
+                by_slug[slug] = SimWindow(window=w)
+    out: list[SimWindow] = []
+    for slug, sw in by_slug.items():
+        w = sw.window
+        for f in sorted(fills.get(slug, []), key=lambda f: int(f.get("ts") or 0)):
+            price, size = _dec(f.get("price")), _dec(f.get("size"))
+            w.trades.append(RefTrade(int(f.get("ts") or 0), str(f.get("outcome") or ""), price, size, price * size))
+            if f.get("late"):
+                sw.late_fills += 1
+                sw.late_pnl += float(size) * (float(price) - (1.0 if f.get("outcome") == w.winner else 0.0))
+        sw.places = places.get(slug, 0)
+        out.append(sw)
+    out.sort(key=lambda s: s.window.start)
+    return out
+
+
+def decompose_window(w: RefWindow) -> tuple[float, float]:
+    """(matched-pair PnL, leftover PnL). Matched pairs earn Up + Down average
+    price - 1; the unmatched lean settles against the winner. The two sum to
+    proceeds - sold winner, which is the window's cash."""
+    up, down = float(w.sold_up), float(w.sold_down)
+    if not w.winner or (up == 0 and down == 0):
+        return 0.0, 0.0
+    avg = {o: (sum(float(t.usdc) for t in w.trades if t.outcome == o) / s if s else 0.0)
+           for o, s in (("Up", up), ("Down", down))}
+    matched = min(up, down)
+    pair = matched * (avg["Up"] + avg["Down"] - 1.0) if matched else 0.0
+    lead = "Up" if up > down else "Down"
+    leftover = abs(up - down) * (avg[lead] - (1.0 if lead == w.winner else 0.0))
+    return pair, leftover
+
+
+def window_table(windows: list[RefWindow], rebate_bps: Decimal) -> dict:
+    """The comparison row: volume, one-sidedness, pair vs leftover, sold-winner, cash and rebate."""
+    n = len(windows)
+    if not n:
+        return {"windows": 0}
+    traded = [w for w in windows if w.trades]
+    one_sided = [w for w in traded if w.sold_up == 0 or w.sold_down == 0]
+    shares = sum(float(w.sold_up + w.sold_down) for w in windows)
+    known = [w for w in windows if w.winner]
+    won = sum(float(w.sold_winner) for w in known)
+    sold_known = sum(float(w.sold_up + w.sold_down) for w in known)
+    cash = [float(w.cash) for w in windows]
+    proceeds = sum(float(w.proceeds) for w in windows)
+    rebate = proceeds * float(rebate_bps) / 10_000
+    pair = leftover = 0.0
+    for w in windows:
+        p, lo = decompose_window(w)
+        pair += p
+        leftover += lo
+    buckets: dict[str, dict] = {}
+    minutes: dict[str, dict] = {}
+    for w in known:
+        for t in w.trades:
+            price, size = float(t.price), float(t.size)
+            pnl = size * (price - (1.0 if t.outcome == w.winner else 0.0))
+            label = next(b[2] for b in PRICE_BUCKETS if b[0] <= price < b[1])
+            minute = str(min(4, max(0, (t.ts - w.start) // 60)))
+            for table, key in ((buckets, label), (minutes, minute)):
+                row = table.setdefault(key, {"fills": 0, "shares": 0.0, "pnl": 0.0, "won": 0.0})
+                row["fills"] += 1
+                row["shares"] += size
+                row["pnl"] += pnl
+                row["won"] += size if t.outcome == w.winner else 0.0
+    for table in (buckets, minutes):
+        for row in table.values():
+            row["pnl_per_share"] = round(row["pnl"] / row["shares"], 4) if row["shares"] else None
+            row["sold_winner_pct"] = round(row.pop("won") / row["shares"] * 100, 1) if row["shares"] else None
+            row["shares"] = round(row["shares"], 1)
+            row["pnl"] = round(row["pnl"], 2)
+    distinct = [len({t.price for t in w.trades if t.outcome == o}) for w in traded for o in ("Up", "Down")
+                if any(t.outcome == o for t in w.trades)]
+    return {
+        "windows": n,
+        "traded_windows": len(traded),
+        "fills_per_window": round(sum(w.fills for w in windows) / n, 2),
+        "shares_per_window": round(shares / n, 1),
+        "one_sided_pct": round(len(one_sided) / len(traded) * 100, 1) if traded else None,
+        "lean_median": statistics.median(float(w.lean) for w in windows),
+        "sold_winner_pct": round(won / sold_known * 100, 1) if sold_known else None,
+        "pair_pnl": round(pair, 2),
+        "leftover_pnl": round(leftover, 2),
+        "cash_per_window": round(sum(cash) / n, 4),
+        "rebate_per_window": round(rebate / n, 4),
+        "cash_plus_rebate_per_window": round((sum(cash) + rebate) / n, 4),
+        "worst": round(min(cash), 2),
+        "cash_total": round(sum(cash), 2),
+        "distinct_prices_per_side_median": statistics.median(distinct) if distinct else 0,
+        "by_price": {b[2]: buckets[b[2]] for b in PRICE_BUCKETS if b[2] in buckets},
+        "by_minute": {k: minutes[k] for k in sorted(minutes)},
+    }
+
+
+def simcompare(
+    sim: list[SimWindow], ref: list[RefWindow], *, rebate_bps: Decimal, baseline: list[SimWindow] | None = None,
+) -> dict:
+    """The simulation against the reference on the windows both settled, and
+    optionally against a baseline simulation log on the windows all three share."""
+    from spork30.diagnostics import block_bootstrap
+
+    ref_by = {w.start: w for w in ref}
+    base_by = {s.window.start: s for s in baseline} if baseline else {}
+    overlap = [s for s in sim if s.window.start in ref_by]
+    sim_w = [s.window for s in sim]
+    late = sum(s.late_fills for s in sim)
+    fills = sum(s.window.fills for s in sim)
+    out = {
+        "sim_all": {**window_table(sim_w, rebate_bps), "late_fill_share": round(late / fills, 3) if fills else None,
+                    "late_fill_pnl": round(sum(s.late_pnl for s in sim), 2),
+                    "places_per_window_median": statistics.median(s.places for s in sim) if sim else 0},
+        "overlap_windows": len(overlap),
+        "sim_overlap": window_table([s.window for s in overlap], rebate_bps),
+        "reference_overlap": window_table([ref_by[s.window.start] for s in overlap], rebate_bps),
+    }
+    if baseline:
+        shared = [s for s in sim if s.window.start in base_by]
+
+        def objective(w: RefWindow) -> float:
+            return float(w.cash) + float(w.proceeds) * float(rebate_bps) / 10_000
+
+        diffs = [objective(s.window) - objective(base_by[s.window.start].window) for s in shared]
+        out["baseline_shared_windows"] = len(shared)
+        out["baseline"] = window_table([base_by[s.window.start].window for s in shared], rebate_bps)
+        out["candidate_on_shared"] = window_table([s.window for s in shared], rebate_bps)
+        out["paired_improvement"] = block_bootstrap(diffs) if diffs else {}
+    out["acceptance"] = acceptance(out)
+    return out
+
+
+def acceptance(rep: dict) -> dict:
+    """The plan's gate. Each check is None when its inputs are missing."""
+    sim, ref = rep.get("sim_overlap") or {}, rep.get("reference_overlap") or {}
+    checks: dict[str, bool | None] = {}
+    checks["one_sided_under_10pct"] = (sim["one_sided_pct"] < 10) if sim.get("one_sided_pct") is not None else None
+    if sim.get("sold_winner_pct") is not None and ref.get("sold_winner_pct") is not None:
+        checks["sold_winner_within_2pts"] = abs(sim["sold_winner_pct"] - ref["sold_winner_pct"]) <= 2
+    else:
+        checks["sold_winner_within_2pts"] = None
+    if sim.get("shares_per_window") is not None and ref.get("shares_per_window"):
+        checks["volume_within_30pct"] = abs(sim["shares_per_window"] / ref["shares_per_window"] - 1) <= 0.30
+    else:
+        checks["volume_within_30pct"] = None
+    imp = rep.get("paired_improvement") or {}
+    checks["beats_baseline_ci_excludes_zero"] = (imp["ci_low"] > 0) if imp else None
+    checks["worst_window_not_below_-40"] = (sim["worst"] >= -40) if sim.get("worst") is not None else None
+    decided = [v for v in checks.values() if v is not None]
+    return {"checks": checks, "passed": bool(decided) and all(decided) and len(decided) == len(checks)}
+
+
+def _print_simcompare(rep: dict) -> None:
+    def row(label: str, table: dict) -> None:
+        if not table.get("windows"):
+            print(f"  {label:<20} no windows")
+            return
+        print(f"  {label:<20} n {table['windows']:>4}  fills/w {table['fills_per_window']:>6}  sh/w {table['shares_per_window']:>6}  "
+              f"one-sided {table['one_sided_pct']!s:>5}%  lean {table['lean_median']:>5.1f}  win% {table['sold_winner_pct']!s:>5}  "
+              f"pair {table['pair_pnl']:>+9.2f}  leftover {table['leftover_pnl']:>+9.2f}  cash/w {table['cash_per_window']:>+8.4f}  "
+              f"+rebate {table['cash_plus_rebate_per_window']:>+8.4f}  worst {table['worst']:>+7.2f}  "
+              f"prices/side {table['distinct_prices_per_side_median']}")
+
+    sim_all = rep["sim_all"]
+    print(f"simulation: late fills {sim_all.get('late_fill_share')} of fills, pnl {sim_all.get('late_fill_pnl')}; "
+          f"places/window median {sim_all.get('places_per_window_median')}")
+    row("sim (all)", sim_all)
+    print(f"{rep['overlap_windows']} windows settled in both:")
+    row("sim", rep["sim_overlap"])
+    row("reference", rep["reference_overlap"])
+    if "paired_improvement" in rep:
+        imp = rep["paired_improvement"]
+        print(f"{rep['baseline_shared_windows']} windows shared with the baseline:")
+        row("baseline", rep["baseline"])
+        row("candidate", rep["candidate_on_shared"])
+        if imp:
+            print(f"  paired improvement {imp['mean']:+.4f}/w  95% CI [{imp['ci_low']:+.4f}, {imp['ci_high']:+.4f}]")
+    for label, key in (("sim", "sim_overlap"), ("reference", "reference_overlap")):
+        table = rep[key]
+        for name in ("by_price", "by_minute"):
+            for bucket, b in (table.get(name) or {}).items():
+                print(f"    {label:<9} {name:<9} {bucket:<10} fills {b['fills']:>6} sh {b['shares']:>9} "
+                      f"win% {b['sold_winner_pct']!s:>5} pnl/sh {b['pnl_per_share']!s:>8} pnl {b['pnl']:>+9.2f}")
+    acc = rep["acceptance"]
+    print("acceptance: " + ("PASS" if acc["passed"] else "not passed") + "  "
+          + "  ".join(f"{k}={v}" for k, v in acc["checks"].items()))
+
+
 # --- CLI --------------------------------------------------------------------------------------
 
 
@@ -624,6 +856,12 @@ def main(argv: list[str] | None = None) -> None:
     a.add_argument("--max-lean", default=None)
     a.add_argument("--no-replay", action="store_true")
     a.add_argument("--json", default="")
+    s = sub.add_parser("simcompare", help="a simulation decision log vs the reference on the same windows")
+    s.add_argument("--log", required=True, help="the simulation's decisions.jsonl")
+    s.add_argument("--baseline", default="", help="a baseline simulation log for the paired comparison")
+    s.add_argument("--since", type=int, default=0)
+    s.add_argument("--rebate-bps", default=str(StrategyConfig().maker_rebate_bps))
+    s.add_argument("--json", default="")
     args = parser.parse_args(argv)
     cache = Path(args.activity)
 
@@ -647,6 +885,14 @@ def main(argv: list[str] | None = None) -> None:
         if args.windows_json:
             Path(args.windows_json).parent.mkdir(parents=True, exist_ok=True)
             Path(args.windows_json).write_text(json.dumps([w.to_json() for w in windows]), encoding="utf-8")
+        return
+    if args.command == "simcompare":
+        baseline = sim_windows(Path(args.baseline)) if args.baseline else None
+        rep = simcompare(sim_windows(Path(args.log)), windows, rebate_bps=Decimal(args.rebate_bps), baseline=baseline)
+        _print_simcompare(rep)
+        if args.json:
+            Path(args.json).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.json).write_text(json.dumps(rep, indent=1, default=str), encoding="utf-8")
         return
 
     defaults = StrategyConfig()
