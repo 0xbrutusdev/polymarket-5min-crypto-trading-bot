@@ -2,3 +2,7 @@ spork30/.env
 .env
 data/runtime/
 data/backtest/
+data/reference/
+docs/
+logs/
+scripts/
