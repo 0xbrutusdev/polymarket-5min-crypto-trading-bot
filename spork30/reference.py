@@ -6,8 +6,9 @@ profile, and alignment of its real fills with the replay's modelled ones.
     python -m spork30.reference align --queue 250 --lag 2 --json data/reference/align.json
     python -m spork30.reference simcompare --log data/runtime/sim/decisions.jsonl [--baseline other/decisions.jsonl]
 
-Everything here is read-only against public endpoints (data-api.polymarket.com)
-and the local print cache. Nothing signs or sends.
+Everything here is read-only against public endpoints
+(data-api.polymarket.com/v2/activity, paged by cursor) and the local print
+cache. Nothing signs or sends.
 
 What the account's tape shows directly: splits, every fill (price, size,
 time, outcome), merges, redeems, daily MAKER_REBATE payments. What is
@@ -24,6 +25,8 @@ import math
 import statistics
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
@@ -38,33 +41,65 @@ from spork30.fillmodel import TICK, ReconstructedBook
 from spork30.strategy import sigma_per_second
 
 ADDRESS = "0x1dd2a69e73ba444ecd5d87f0073d51a670ad51c2"
-DATA_API = "https://data-api.polymarket.com/activity"
+DATA_API = "https://data-api.polymarket.com/v2/activity"
 SLUG_PREFIX = "btc-updown-5m-"
 DEFAULT_CACHE = Path("data/reference/activity.json")
+# v2 rejects offset (HTTP 400) and caps limit at 1000. The cursor walks the window.
 PAGE = 500
-# The API refuses offsets past about 5000; the time window is moved instead.
-MAX_OFFSET = 4500
 
 
 # --- activity -------------------------------------------------------------------------
 
 
-def _get(url: str, tries: int = 4) -> list:
+def _retry_delay(exc: BaseException, attempt: int) -> float:
+    """429 and 503 honor Retry-After (seconds); every other failure uses the backoff."""
+    if isinstance(exc, urllib.error.HTTPError) and exc.code in {429, 503}:
+        header = exc.headers.get("Retry-After") if exc.headers is not None else None
+        if header:
+            try:
+                return max(0.0, float(header))
+            except ValueError:
+                pass
+    return 2 * (attempt + 1)
+
+
+def _get(url: str, tries: int = 4) -> object:
     for attempt in range(tries):
         try:
             request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(request, timeout=60) as response:
                 return json.loads(response.read().decode("utf-8"))
-        except Exception:
+        except Exception as exc:
+            delay = _retry_delay(exc, attempt)
+            if isinstance(exc, urllib.error.HTTPError):
+                exc.close()
             if attempt == tries - 1:
                 raise
-            time.sleep(2 * (attempt + 1))
-    return []
+            time.sleep(delay)
+    return {}
 
 
 def _key(row: dict) -> tuple:
     return (row.get("transactionHash"), row.get("asset"), row.get("type"), str(row.get("size")),
             str(row.get("price")), int(row.get("timestamp") or 0), row.get("outcome"))
+
+
+def _activity_row(row: dict) -> dict:
+    """Map a v2 activity row onto the cache's field names.
+
+    Reconstruction keeps reading usdcSize, transactionHash, and asset. v2 sends
+    usdc_size, transaction_hash, and token_id. size, price, timestamp, type,
+    slug, and outcome are unchanged. A row that already uses the cache names is
+    left as it is, so an existing cache file still merges.
+    """
+    out = dict(row)
+    if "usdcSize" not in out and "usdc_size" in row:
+        out["usdcSize"] = row.get("usdc_size")
+    if "transactionHash" not in out and "transaction_hash" in row:
+        out["transactionHash"] = row.get("transaction_hash")
+    if "asset" not in out and "token_id" in row:
+        out["asset"] = row.get("token_id")
+    return out
 
 
 def load_activity(cache: Path = DEFAULT_CACHE) -> list[dict]:
@@ -78,32 +113,46 @@ def fetch_activity(
     quiet: bool = False, sleep: float = 0.3,
 ) -> list[dict]:
     """Pull every activity row for `user` with timestamp >= `since` (and <= `until`),
-    merge it into the cache and return the full cached list, oldest first."""
+    merge it into the cache and return the full cached list, oldest first.
+
+    Pages follow pagination.next_cursor. The same user, start, end, and limit
+    go on every request; the cursor carries only the seek anchor. A null cursor
+    ends the walk, including when the page is full. data: null is an empty page.
+    """
     rows: dict[tuple, dict] = {_key(r): r for r in load_activity(cache)}
     end = until if until is not None else int(time.time())
-    offset = 0
+    cursor: str | None = None
     while True:
-        url = f"{DATA_API}?user={user}&limit={PAGE}&offset={offset}&end={end}"
+        query: dict[str, object] = {"user": user, "limit": PAGE, "start": since, "end": end}
+        if cursor:
+            query["cursor"] = cursor
+        url = f"{DATA_API}?{urllib.parse.urlencode(query)}"
         try:
-            page = _get(url)
+            payload = _get(url)
         except Exception as exc:
             if not quiet:
                 print(f"page failed: {exc}", file=sys.stderr)
             break
-        if not page:
+        if not isinstance(payload, dict):
+            if not quiet:
+                print("page failed: expected {data, pagination}", file=sys.stderr)
             break
-        for r in page:
-            rows[_key(r)] = r
-        oldest = min(int(r["timestamp"]) for r in page)
-        if not quiet:
-            print(f"end {end} offset {offset} got {len(page)} oldest "
+        data = payload.get("data")
+        page = data if isinstance(data, list) else []
+        pagination = payload.get("pagination")
+        if not isinstance(pagination, dict):
+            pagination = {}
+        for raw in page:
+            row = _activity_row(raw)
+            rows[_key(row)] = row
+        if page and not quiet:
+            oldest = min(int(r["timestamp"]) for r in page)
+            print(f"end {end} got {len(page)} oldest "
                   f"{time.strftime('%Y-%m-%d %H:%M', time.gmtime(oldest))}", flush=True)
-        if oldest < since or len(page) < PAGE:
+        nxt = pagination.get("next_cursor")
+        if not nxt:
             break
-        offset += PAGE
-        if offset >= MAX_OFFSET:
-            end = oldest
-            offset = 0
+        cursor = str(nxt)
         time.sleep(sleep)
     merged = sorted(rows.values(), key=lambda r: int(r["timestamp"]))
     cache.parent.mkdir(parents=True, exist_ok=True)
