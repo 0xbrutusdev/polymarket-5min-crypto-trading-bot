@@ -1,11 +1,16 @@
 """Reference-account gap audit (Oct 2026): reference reconstruction, the spot
 feed's book-ticker prints, the stale-spot grace hold and the sim's CLOB book."""
 
+import io
+import json
+import urllib.error
 from decimal import Decimal
+from email.message import Message
+from urllib.parse import parse_qs, urlsplit
 
 from spork30.config import StrategyConfig
 from spork30.models import BookTop, Phase
-from spork30.reference import profile, rebate_rows, windows_from_activity
+from spork30.reference import ADDRESS, fetch_activity, profile, rebate_rows, windows_from_activity
 from spork30.simulate import BookPoller
 from spork30.spotfeed import SpotFeed
 
@@ -66,6 +71,130 @@ def test_winner_is_inferred_from_the_side_sold_more_without_a_redeem():
     rows = [r for r in _activity() if r["type"] != "REDEEM"]
     w = windows_from_activity(rows, settled_before=BASE + 2 * WINDOW)[0]
     assert (w.winner, w.winner_source) == ("Up", "inferred")
+
+
+class _Body:
+    def __init__(self, payload: dict):
+        self._raw = json.dumps(payload).encode()
+
+    def read(self) -> bytes:
+        return self._raw
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def _v2(kind: str, ts: int, *, tx: str, outcome: str = "", price: float = 0, size: float = 0,
+        usdc: float = 0, token: str = "usdc", slug: str = SLUG) -> dict:
+    return {"type": kind, "timestamp": ts, "slug": slug, "outcome": outcome, "price": price,
+            "size": size, "usdc_size": usdc, "transaction_hash": tx, "token_id": token}
+
+
+def _query(url: str) -> dict[str, list[str]]:
+    return parse_qs(urlsplit(url).query)
+
+
+def test_fetch_activity_pages_v2_by_cursor_and_keeps_cache_field_names(tmp_path, monkeypatch):
+    pages = [
+        {"data": [
+            _v2("SPLIT", BASE - 293, size=750, usdc=750, tx="0xsplit"),
+            _v2("TRADE", BASE + 40, outcome="Up", price=0.5, size=10, usdc=5, token="tok-up", tx="0xtrade"),
+        ], "pagination": {"has_more": True, "next_cursor": "page-two", "limit": 500}},
+        {"data": [
+            _v2("MERGE", BASE + 358, size=740, usdc=740, tx="0xmerge"),
+            _v2("REDEEM", BASE + 366, outcome="Up", size=10, usdc=10, token="tok-up", tx="0xredeem"),
+        ], "pagination": {"has_more": False, "next_cursor": None, "limit": 500}},
+    ]
+    urls: list[str] = []
+
+    def fake_urlopen(request, timeout=60):
+        urls.append(request.full_url)
+        return _Body(pages[len(urls) - 1])
+
+    monkeypatch.setattr("spork30.reference.urllib.request.urlopen", fake_urlopen)
+    cache = tmp_path / "activity.json"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps([_row("MAKER_REBATE", BASE + 86400, usdc="1.2")]), encoding="utf-8")
+    since, until = BASE - 1000, BASE + 10000
+    rows = fetch_activity(since=since, until=until, cache=cache, quiet=True, sleep=0)
+
+    assert len(urls) == 2
+    for url in urls:
+        query = _query(url)
+        assert urlsplit(url).path.endswith("/v2/activity")
+        assert query["user"] == [ADDRESS]
+        assert query["start"] == [str(since)] and query["end"] == [str(until)] and query["limit"] == ["500"]
+        assert "offset" not in query
+    assert "cursor" not in _query(urls[0])
+    assert _query(urls[1])["cursor"] == ["page-two"]
+
+    stored = json.loads(cache.read_text(encoding="utf-8"))
+    trade = next(r for r in stored if r["transactionHash"] == "0xtrade")
+    assert (trade["usdcSize"], trade["asset"], trade["size"], trade["outcome"]) == (5, "tok-up", 10, "Up")
+    assert any(r["type"] == "MAKER_REBATE" and r["usdcSize"] == "1.2" for r in stored)
+    windows = windows_from_activity(rows, settled_before=BASE + 2 * WINDOW)
+    assert len(windows) == 1
+    assert windows[0].cash == Decimal("5")
+    assert (windows[0].winner, windows[0].winner_source) == ("Up", "redeem")
+
+
+def test_fetch_activity_stops_on_a_null_cursor_even_when_the_page_is_full(tmp_path, monkeypatch):
+    monkeypatch.setattr("spork30.reference.PAGE", 2)
+    page = {"data": [
+        _v2("MAKER_REBATE", BASE, usdc=1, tx="0xa"),
+        _v2("MAKER_REBATE", BASE + 1, usdc=2, tx="0xb"),
+    ], "pagination": {"has_more": True, "next_cursor": None}}
+    calls: list[str] = []
+
+    def fake_urlopen(request, timeout=60):
+        calls.append(request.full_url)
+        if len(calls) > 1:
+            raise AssertionError("walk continued after a null cursor")
+        return _Body(page)
+
+    monkeypatch.setattr("spork30.reference.urllib.request.urlopen", fake_urlopen)
+    rows = fetch_activity(since=BASE, until=BASE + 10, cache=tmp_path / "activity.json", quiet=True, sleep=0)
+    assert len(calls) == 1 and "offset" not in _query(calls[0])
+    assert [r["transactionHash"] for r in rows] == ["0xa", "0xb"]
+
+
+def test_fetch_activity_treats_null_data_as_an_empty_page(tmp_path, monkeypatch):
+    pages = [
+        {"data": None, "pagination": {"has_more": True, "next_cursor": "next"}},
+        {"data": [_v2("MAKER_REBATE", BASE, usdc=1, tx="0xa")],
+         "pagination": {"has_more": False, "next_cursor": None}},
+    ]
+    calls: list[str] = []
+
+    def fake_urlopen(request, timeout=60):
+        calls.append(request.full_url)
+        return _Body(pages[len(calls) - 1])
+
+    monkeypatch.setattr("spork30.reference.urllib.request.urlopen", fake_urlopen)
+    rows = fetch_activity(since=BASE, until=BASE + 10, cache=tmp_path / "activity.json", quiet=True, sleep=0)
+    assert len(calls) == 2 and _query(calls[1])["cursor"] == ["next"]
+    assert [r["usdcSize"] for r in rows] == [1]
+
+
+def test_fetch_retries_429_using_retry_after(tmp_path, monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr("spork30.reference.time.sleep", lambda delay: sleeps.append(delay))
+    headers = Message()
+    headers["Retry-After"] = "7"
+    calls = {"n": 0}
+
+    def fake_urlopen(request, timeout=60):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise urllib.error.HTTPError(request.full_url, 429, "busy", headers, io.BytesIO(b""))
+        return _Body({"data": [], "pagination": {"has_more": False, "next_cursor": None}})
+
+    monkeypatch.setattr("spork30.reference.urllib.request.urlopen", fake_urlopen)
+    rows = fetch_activity(since=BASE, until=BASE + 10, cache=tmp_path / "activity.json", quiet=True, sleep=0)
+    assert calls["n"] == 2 and sleeps == [7.0] and rows == []
 
 
 def test_spot_feed_reads_trades_and_book_ticker_from_the_combined_stream():
